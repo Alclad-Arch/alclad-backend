@@ -468,5 +468,42 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: "Internal error" });
 });
 
+// One-off sweep: encrypt any row still holding plaintext.
+//
+// Reading a row re-encrypts it (openRow), but that only ever reaches accounts that are
+// actually being used. A token belonging to someone who hasn't touched Salesforce since
+// the key was introduced would sit in plaintext indefinitely — which is exactly what
+// encryption at rest is supposed to prevent. Lazy migration is the right behaviour on the
+// hot path; it is not a migration strategy on its own.
+//
+// Runs after the listener so a slow or failing sweep can never stop the service booting.
+async function encryptTokensAtRest() {
+  if (!ENC_KEY) return;
+  const { data, error } = await supabaseAdmin
+    .from("salesforce_tokens").select("user_id, access_token, refresh_token");
+  if (error) { console.error("[security] token sweep failed:", error.message); return; }
+
+  let done = 0, skipped = 0;
+  for (const row of data || []) {
+    if (isSealed(row.access_token) && isSealed(row.refresh_token)) continue;
+    const access = unseal(row.access_token, row.user_id);
+    const refresh = unseal(row.refresh_token, row.user_id);
+    // Never overwrite a row we couldn't read — that would replace an unreadable token with
+    // a re-sealed null and destroy any chance of recovering it.
+    if (access == null || refresh == null) { skipped++; continue; }
+    const { error: e } = await supabaseAdmin.from("salesforce_tokens").update({
+      access_token: seal(access, row.user_id),
+      refresh_token: seal(refresh, row.user_id),
+    }).eq("user_id", row.user_id);
+    if (e) { console.error("[security] could not encrypt token for", row.user_id, e.message); skipped++; }
+    else done++;
+  }
+  if (done) console.log(`[security] encrypted ${done} stored Salesforce token(s) at rest`);
+  if (skipped) console.error(`[security] ${skipped} token(s) could NOT be encrypted — check the logs above`);
+}
+
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`Backend running on :${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Backend running on :${PORT}`);
+  encryptTokensAtRest().catch((e) => console.error("[security] token sweep threw:", e && e.message));
+});
