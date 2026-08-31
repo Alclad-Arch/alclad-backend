@@ -28,6 +28,7 @@ import cors from "cors";
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
 import { loadKey, isSealed, seal as sealWith, unseal as unsealWith } from "./tokenCrypto.js";
+import { buildSummaryQuery, shapeSummary } from "./oppSummary.js";
 
 const app = express();
 
@@ -194,6 +195,20 @@ setInterval(() => {
 const SF_ROLES = (process.env.SF_ALLOWED_ROLES || "").split(",").map((s) => s.trim()).filter(Boolean);
 if (!SF_ROLES.length) {
   console.warn("[security] SF_ALLOWED_ROLES is not set — ANY authenticated app user can use the Salesforce proxy. Set it to e.g. super_admin,admin");
+}
+
+// Session only: a valid app login, no Salesforce role required. Split out of requireUser
+// so the opportunity-summary route can serve users who deliberately have NO Salesforce
+// access — gating that route on SF_ALLOWED_ROLES would lock out exactly the people it
+// exists for. Everything else still goes through requireUser.
+async function requireSession(req, res, next) {
+  const h = req.headers.authorization || "";
+  const jwt = h.startsWith("Bearer ") ? h.slice(7) : null;
+  if (!jwt) return res.status(401).json({ error: "No auth token" });
+  const { data, error } = await supabaseAdmin.auth.getUser(jwt);
+  if (error || !data?.user) return res.status(401).json({ error: "Invalid session" });
+  req.userId = data.user.id;
+  next();
 }
 
 async function requireUser(req, res, next) {
@@ -416,6 +431,113 @@ const SF_PATH_OK = /^services\/data\/v\d{2}\.\d\/[A-Za-z0-9_\-/]+(\?.*)?$/;
 const SF_MAX_URL = 8000;
 const SF_TIMEOUT_MS = 20000;
 const SF_MAX_BYTES = 25 * 1024 * 1024;
+
+// ── Opportunity summary: the budget's discrepancy card, for EVERY app user ──────────
+//
+// The card compares a budget against its Salesforce opportunity. Every other route here
+// runs as the CALLER, so a user who has never linked their own Salesforce got a 401 and
+// the card vanished (Jed 2026-08-31: it should show for all estimating/budget users).
+//
+// This route answers from the caller's own connection when they have one — preserving
+// their field-level security — and otherwise from a SERVICE ACCOUNT held here.
+//
+// It is deliberately NOT a service-account fallback on the generic proxy below: that one
+// forwards arbitrary SOQL, so falling IT back would let any app user run any query they
+// liked as the service identity. This route builds its own query and can only ever return
+// one opportunity's name, number, Amount and budgeted GP.
+//
+// The mapped field names arrive from the client, so they are validated as bare API names
+// before being interpolated — an unvalidated field param is a SOQL injection hole. That
+// validation and the query building live in oppSummary.js, where they are unit-tested.
+
+let svcTok = null;   // { access_token, instance_url, at } — in-memory only, never persisted
+async function serviceToken(force) {
+  if (!process.env.SF_SERVICE_REFRESH_TOKEN) return null;
+  if (!force && svcTok && Date.now() - svcTok.at < 30 * 60 * 1000) return svcTok;
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: process.env.SF_SERVICE_REFRESH_TOKEN,
+    client_id: process.env.SF_SERVICE_CLIENT_ID || process.env.SF_CLIENT_ID,
+    client_secret: process.env.SF_SERVICE_CLIENT_SECRET || process.env.SF_CLIENT_SECRET,
+  });
+  const r = await fetch(`${process.env.SF_LOGIN_URL}/services/oauth2/token`, {
+    method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body,
+    signal: AbortSignal.timeout(SF_TIMEOUT_MS),
+  });
+  if (!r.ok) { console.error("service-account refresh failed:", r.status, await r.text()); svcTok = null; return null; }
+  const t = await r.json();
+  svcTok = {
+    access_token: t.access_token,
+    instance_url: t.instance_url || process.env.SF_SERVICE_INSTANCE_URL || "",
+    at: Date.now(),
+  };
+  return svcTok.instance_url ? svcTok : null;
+}
+
+app.get("/api/salesforce/opportunity-summary", requireSession, rateLimit({ perMin: RATE_PER_MIN, perDay: RATE_PER_DAY, action: "opp_summary" }), async (req, res) => {
+  const id = String(req.query.id || "").trim();
+  const gpField = String(req.query.gpField || "").trim();
+  const numberField = String(req.query.numberField || "").trim();
+  const q = buildSummaryQuery(id, gpField, numberField);
+  if (!q) return res.status(400).json({ error: "Bad opportunity id" });
+  const extra = q.extra;
+  const path = `services/data/v60.0/query?q=${encodeURIComponent(q.soql)}`;
+  const minimal = `services/data/v60.0/query?q=${encodeURIComponent(q.minimalSoql)}`;
+
+  // caller's own connection first — their field-level security is the right one to apply
+  let token = null, instance = null, viaService = false;
+  const { data: raw } = await supabaseAdmin.from("salesforce_tokens").select("*").eq("user_id", req.userId).maybeSingle();
+  const row = raw ? openRow(raw, req.userId) : null;
+  if (row) { token = row.access_token; instance = row.instance_url; }
+
+  const call = (p, tk, inst) => fetch(`${inst}/${p}`, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${tk}`, "Content-Type": "application/json" },
+    signal: AbortSignal.timeout(SF_TIMEOUT_MS),
+  });
+
+  try {
+    let r = token ? await call(path, token, instance) : null;
+    if (r && r.status === 401) {                       // their token expired — refresh once
+      const refreshed = await refreshSalesforce(req.userId, row);
+      r = refreshed ? await call(path, refreshed.access_token, refreshed.instance_url) : null;
+      if (refreshed) { token = refreshed.access_token; instance = refreshed.instance_url; }
+    }
+    if (!r || !r.ok) {                                 // no connection, or theirs can't answer
+      const svc = await serviceToken(false);
+      if (!svc) {
+        audit(req, "opp_summary_unavailable", id, 503);
+        return res.status(503).json({ error: "No Salesforce connection available for this request" });
+      }
+      viaService = true;
+      r = await call(path, svc.access_token, svc.instance_url);
+      if (r.status === 401) {                          // cached service token stale — force one refresh
+        const fresh = await serviceToken(true);
+        if (!fresh) return res.status(503).json({ error: "Salesforce service account unavailable" });
+        r = await call(path, fresh.access_token, fresh.instance_url);
+      }
+      instance = svc.instance_url; token = svc.access_token;
+    }
+    // one mapped field the identity can't see fails the whole query — drop the extras and
+    // retry bare, so a bad GP mapping costs the GP column rather than the whole card
+    if (!r.ok && extra.length) r = await call(minimal, token, instance);
+    if (!r.ok) {
+      const msg = await r.text();
+      console.warn("opportunity-summary upstream:", r.status, msg.slice(0, 300));
+      audit(req, "opp_summary_failed", `${id} — ${r.status}`, r.status);
+      return res.status(r.status === 404 ? 404 : 502).json({ error: "Salesforce could not answer" });
+    }
+    const data = await r.json();
+    const rec = (data.records || [])[0];
+    if (!rec) { audit(req, "opp_summary", `${id} — not found`, 404); return res.status(404).json({ error: "Opportunity not found" }); }
+    audit(req, "opp_summary", `${id}${viaService ? " (service)" : ""}`, 200);
+    res.json(shapeSummary(rec, { id, gpField, numberField, viaService }));
+  } catch (e) {
+    console.error("opportunity-summary error:", e && e.name, e && e.message);
+    audit(req, "opp_summary_error", `${id} — ${e && e.name}`, 502);
+    res.status(502).json({ error: "Salesforce request failed" });
+  }
+});
 
 app.get("/api/salesforce/*splat", requireUser, rateLimit({ perMin: RATE_PER_MIN, perDay: RATE_PER_DAY, action: "proxy" }), async (req, res) => {
   const sfPath = req.originalUrl.replace(/^\/api\/salesforce\//i, "");   // strip prefix, keep path + query
