@@ -120,6 +120,22 @@ for (const [e, s, d] of results) console.log(pad(e, 22) + pad(s, 10) + d);
 // look at this line.
 console.log(`\ngranted scope: ${lastScope() || "(no refresh ran)"}`);
 
+// WHO does this token think it is? The scope is right, the tenant is right, the user has UI
+// access to these forms, and every one is refused — so the remaining question is whether the
+// token represents the identity we assume. OIDC's userinfo endpoint answers it directly, and
+// asking should have come long before five rounds of granting rights.
+try {
+  const { getMyobAccessToken } = await import("./myobToken.js");
+  const token = await getMyobAccessToken(db);
+  const who = await fetch(`${cfg.instance}/identity/connect/userinfo`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+  });
+  const text = await who.text().catch(() => "");
+  console.log(`identity (userinfo ${who.status}): ${text.replace(/\s+/g, " ").slice(0, 220) || "(empty)"}`);
+} catch (e) {
+  console.log(`identity: could not be read — ${(e && e.message) || e}`);
+}
+
 const ok = results.filter((r) => r[1] === "OK").length;
 console.log(`\n${ok} of ${results.length} readable.`);
 
@@ -144,7 +160,7 @@ if (ok < results.length && controlsOk > 0) {
   console.log("\nA 403 naming a form is an access-rights gap, not a broken connection: open that");
   console.log("screen in Acumatica, Tools -> Access Rights, give the role View Only, and re-run.");
   console.log("Re-running is free now — the rotated refresh token is stored, not printed.\n");
-} else {
+} else if (ok === results.length) {
   console.log("\nEverything the integration needs is readable.\n");
 }
 
