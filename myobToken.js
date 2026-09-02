@@ -34,6 +34,7 @@ const TOKEN_PATH = "/identity/connect/token";
 const EXPIRY_MARGIN_MS = 60_000;
 
 let cached = null;        // { accessToken, expiresAt }
+let lastGrantedScope = null;   // what the token actually carries, for diagnostics
 let inFlight = null;      // shared promise while a refresh is running
 
 const trimUrl = (u) => String(u || "").replace(/\/+$/, "");
@@ -129,6 +130,11 @@ async function refreshNow(db, cfg) {
   }
 
   const ttl = Number(body.expires_in || 3600) * 1000;
+  // The GRANTED scope, which is not necessarily the scope that was requested. Acumatica can
+  // issue a token carrying fewer scopes than asked for — authentication then succeeds while
+  // every API call returns 403 "insufficient rights", which looks like a permissions problem
+  // on the target screen and is not. Kept so a caller can report it.
+  lastGrantedScope = body.scope || "(none reported)";
   cached = { accessToken: body.access_token, expiresAt: Date.now() + ttl - EXPIRY_MARGIN_MS };
   return cached.accessToken;
 }
@@ -165,5 +171,8 @@ export async function myobGet(db, entity, query = "", env = process.env) {
   return res.json();
 }
 
+// What the last issued token actually carried. Null until a refresh has run.
+export const lastScope = () => lastGrantedScope;
+
 // Testing seam — the in-memory cache would otherwise leak between cases.
-export function __resetMyobTokenCache() { cached = null; inFlight = null; }
+export function __resetMyobTokenCache() { cached = null; inFlight = null; lastGrantedScope = null; }

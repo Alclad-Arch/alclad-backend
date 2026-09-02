@@ -16,7 +16,7 @@
 //   TOKEN_ENC_KEY                               (optional; encrypts the stored token at rest)
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
-import { myobGet, myobConfig } from "./myobToken.js";
+import { myobGet, myobConfig, lastScope } from "./myobToken.js";
 
 const need = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "MYOB_INSTANCE_URL", "MYOB_CLIENT_ID", "MYOB_CLIENT_SECRET"];
 const missing = need.filter((k) => !process.env[k]);
@@ -114,6 +114,12 @@ console.log(pad("ENTITY", 22) + pad("RESULT", 10) + "DETAIL");
 console.log("-".repeat(96));
 for (const [e, s, d] of results) console.log(pad(e, 22) + pad(s, 10) + d);
 
+// What the token ACTUALLY carries. Authentication succeeding tells you nothing about whether
+// the token is entitled to the API: a token issued WITHOUT the api scope refreshes happily
+// and 403s on everything, which is indistinguishable from a permissions problem until you
+// look at this line.
+console.log(`\ngranted scope: ${lastScope() || "(no refresh ran)"}`);
+
 const ok = results.filter((r) => r[1] === "OK").length;
 console.log(`\n${ok} of ${results.length} readable.`);
 
@@ -131,7 +137,10 @@ if (controlsOk === 0) {
   console.log("gate on the Project Accounting module rather than anything about the connection.");
 }
 
-if (ok < results.length) {
+// Only worth saying when the connection is otherwise healthy. Printing "grant the role View
+// Only on that screen" while EVERY entity is refused sent us round Acumatica five times
+// granting rights that were never the problem.
+if (ok < results.length && controlsOk > 0) {
   console.log("\nA 403 naming a form is an access-rights gap, not a broken connection: open that");
   console.log("screen in Acumatica, Tools -> Access Rights, give the role View Only, and re-run.");
   console.log("Re-running is free now — the rotated refresh token is stored, not printed.\n");
