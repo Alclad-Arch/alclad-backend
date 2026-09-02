@@ -25,6 +25,32 @@ if (missing.length) {
   process.exit(1);
 }
 
+// Preflight the Supabase credentials before touching Acumatica. A Supabase key is a JWT that
+// names its own role and project, so the two commonest mistakes — using the anon key, or a key
+// from the other project — are detectable here rather than surfacing as a flat "Invalid API
+// key" against every entity, which reads like an Acumatica problem and is not.
+function describeKey(key) {
+  try {
+    const payload = JSON.parse(Buffer.from(String(key).split(".")[1], "base64url").toString("utf8"));
+    return { role: payload.role || "?", ref: payload.ref || "?" };
+  } catch { return null; }
+}
+const urlRef = (String(process.env.SUPABASE_URL).match(/^https:\/\/([a-z0-9]+)\./) || [])[1] || "?";
+const keyInfo = describeKey(process.env.SUPABASE_SERVICE_ROLE_KEY);
+if (keyInfo) {
+  const problems = [
+    keyInfo.role !== "service_role" && `the key's role is "${keyInfo.role}", not service_role — this table is readable by service_role ONLY`,
+    keyInfo.ref !== urlRef && `the key belongs to project "${keyInfo.ref}" but SUPABASE_URL points at "${urlRef}"`,
+  ].filter(Boolean);
+  if (problems.length) {
+    console.error(`\nSupabase credentials look wrong:\n${problems.map((p) => "  • " + p).join("\n")}\n`);
+    console.error(`Copy the service_role key from the project matching ${urlRef}.\n`);
+    process.exit(1);
+  }
+} else {
+  console.warn("\n(could not decode SUPABASE_SERVICE_ROLE_KEY as a JWT — carrying on, but check it is the service_role key)\n");
+}
+
 const db = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
 });
