@@ -48,7 +48,23 @@ if (keyInfo) {
     process.exit(1);
   }
 } else {
-  console.warn("\n(could not decode SUPABASE_SERVICE_ROLE_KEY as a JWT — carrying on, but check it is the service_role key)\n");
+  // Fail here rather than warning and carrying on. A value that is not a JWT is definitely
+  // not a Supabase key, and the first version's warning let a 23-character placeholder —
+  // the literal text "<prod service role key>" — reach Supabase and come back as "Invalid
+  // API key" against all five entities, which read as an Acumatica fault.
+  const k = String(process.env.SUPABASE_SERVICE_ROLE_KEY || "");
+  console.error(`\nSUPABASE_SERVICE_ROLE_KEY is not a JWT (${k.length} chars, ${k.split(".").length} segment(s)).`);
+  if (k.startsWith("<")) console.error("It still looks like a placeholder — replace it with the real value.");
+  console.error("A service_role key starts \"eyJ\", has three dot-separated segments and runs 200+ chars.\n");
+  process.exit(1);
+}
+
+// Same trap, same fix, for every other value this needs.
+const placeholders = ["SUPABASE_URL", "MYOB_INSTANCE_URL", "MYOB_CLIENT_ID", "MYOB_CLIENT_SECRET", "MYOB_SERVICE_REFRESH_TOKEN"]
+  .filter((k) => String(process.env[k] || "").startsWith("<"));
+if (placeholders.length) {
+  console.error(`\nStill placeholders, not real values: ${placeholders.join(", ")}\n`);
+  process.exit(1);
 }
 
 const db = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
