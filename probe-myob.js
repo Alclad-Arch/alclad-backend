@@ -80,7 +80,17 @@ console.log(`token store: public.integration_tokens${cfg.encKey ? " (encrypted a
 // No $select on CostCode: the first version asked for a field of that name and Acumatica
 // answered 500 "The given key was not present in the dictionary" — a malformed request, not a
 // rights problem, which is exactly the confusion a probe should not create.
+// CONTROLS come first, deliberately. Nathan can open PM301000 in the browser, the role has
+// View Only on it, the authorisation is fresh and the client id carries the right tenant —
+// and it still 403s. So the question is no longer "which right is missing" but "does this
+// token have ANY rights". These entities are ordinary things a full user reads; if they fail
+// too, the fault is token-wide (the Connected Application, the scope, or endpoint access) and
+// nothing about the Projects screen matters.
 const CHECKS = [
+  ["Account", "$top=1"],
+  ["Customer", "$top=1"],
+  ["Employee", "$top=1"],
+  // ── the ones the integration actually needs ──
   ["Project", "$top=1&$select=ProjectID,Description,Status"],
   ["ProjectBudget", "$top=1"],
   ["ProjectTask", "$top=1"],
@@ -106,6 +116,21 @@ for (const [e, s, d] of results) console.log(pad(e, 22) + pad(s, 10) + d);
 
 const ok = results.filter((r) => r[1] === "OK").length;
 console.log(`\n${ok} of ${results.length} readable.`);
+
+// Read the controls separately — the shape of the failure says where to look next.
+const CONTROLS = ["Account", "Customer", "Employee"];
+const controlsOk = results.filter((r) => CONTROLS.includes(r[0]) && r[1] === "OK").length;
+if (controlsOk === 0) {
+  console.log("\nDIAGNOSIS: the token has no rights to ANYTHING, not just Projects.");
+  console.log("So this is not about the Projects screen or the role granted on it. Look at the");
+  console.log("Connected Application itself, the granted scope, or access rights on the web");
+  console.log("service ENDPOINT (there is an 'Integration' node in the access-rights tree).");
+} else if (controlsOk === CONTROLS.length && results.some((r) => r[0] === "Project" && r[1] !== "OK")) {
+  console.log("\nDIAGNOSIS: ordinary entities read fine, so the token and endpoint are healthy.");
+  console.log("The refusal is specific to the Projects forms — which means a rights or licence");
+  console.log("gate on the Project Accounting module rather than anything about the connection.");
+}
+
 if (ok < results.length) {
   console.log("\nA 403 naming a form is an access-rights gap, not a broken connection: open that");
   console.log("screen in Acumatica, Tools -> Access Rights, give the role View Only, and re-run.");
