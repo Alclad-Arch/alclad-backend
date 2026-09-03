@@ -451,12 +451,71 @@ const SF_MAX_BYTES = 25 * 1024 * 1024;
 // validation and the query building live in oppSummary.js, where they are unit-tested.
 
 let svcTok = null;   // { access_token, instance_url, at } — in-memory only, never persisted
+// ── the service grant's refresh token ROTATES, so it cannot live in an env var ──
+//
+// The org enforces "Enable Refresh Token Rotation" on the External Client App and Salesforce
+// Support is required to turn it off (Jed found the setting, 2026-09-03). Rotation means every
+// refresh mints a NEW refresh token and invalidates the one just used — and running code cannot
+// write back to Render's environment. So the old version worked exactly once: the first refresh
+// rotated the grant, the env var went stale, and every refresh after that failed invalid_grant.
+// Which is precisely what Casey and Chad hit on a token that was a week old and in daily use.
+//
+// Same shape as myobToken.js, for the same reason and against the same table: the rotated token is
+// written to integration_tokens on every refresh, and SF_SERVICE_REFRESH_TOKEN is demoted to a
+// BOOTSTRAP — used only until the first stored row exists.
+//
+// rotated_count is the honest health signal: if it stops climbing while people are reading
+// Salesforce, refresh has stopped working and the grant is drifting toward its 30-day idle expiry
+// (also enforced, also Support-only).
+// The last refresh failure, for /api/salesforce/service-status. Recorded rather than re-derived
+// because a diagnostic MUST NOT perform its own refresh: with rotation on, that would mint a new
+// refresh token, invalidate the live one, and throw the new one away — the check would break the
+// thing it is checking. (My first version of that endpoint did exactly this.)
+let svcLastErr = null;
+const SF_SVC_PROVIDER = "salesforce_service";
+const SF_SVC_SEAL_ID = "salesforce_service";
+
+async function sfServiceRefreshToken() {
+  const { data, error } = await supabaseAdmin
+    .from("integration_tokens").select("refresh_token, rotated_count, meta")
+    .eq("provider", SF_SVC_PROVIDER).maybeSingle();
+  if (error) { console.error("integration_tokens read failed:", error.message); return null; }
+  if (data && data.refresh_token) {
+    // A row written before TOKEN_ENC_KEY was set is plaintext — unseal only what is sealed, so
+    // enabling encryption later does not strand the row.
+    const plain = isSealed(data.refresh_token)
+      ? unseal(data.refresh_token, SF_SVC_SEAL_ID) : data.refresh_token;
+    if (!plain) { console.error("stored Salesforce service token could not be decrypted — TOKEN_ENC_KEY may have changed"); return null; }
+    return { refresh: plain, rotations: data.rotated_count || 0, instance: (data.meta && data.meta.instance) || "", seeded: false };
+  }
+  const boot = process.env.SF_SERVICE_REFRESH_TOKEN;
+  if (!boot) return null;
+  return { refresh: boot, rotations: 0, instance: process.env.SF_SERVICE_INSTANCE_URL || "", seeded: true };
+}
+
+async function sfServiceStore(refresh, rotations, instance, note) {
+  const value = ENC_KEY ? seal(refresh, SF_SVC_SEAL_ID) : refresh;
+  const { error } = await supabaseAdmin.from("integration_tokens").upsert({
+    provider: SF_SVC_PROVIDER,
+    refresh_token: value,
+    rotated_count: rotations,
+    meta: { instance, note },
+    updated_at: new Date().toISOString(),
+    updated_by: "sfServiceToken",
+  });
+  // A failed WRITE is the dangerous case: the refresh already happened, so the token we hold is
+  // now the only valid one and it is only in memory. Say so loudly — the next cold start loses it.
+  if (error) console.error("[salesforce] could not persist the rotated service refresh token:", error.message,
+    "— the grant will need re-issuing after the next restart");
+}
+
 async function serviceToken(force) {
-  if (!process.env.SF_SERVICE_REFRESH_TOKEN) return null;
   if (!force && svcTok && Date.now() - svcTok.at < 30 * 60 * 1000) return svcTok;
+  const held = await sfServiceRefreshToken();
+  if (!held) return null;
   const body = new URLSearchParams({
     grant_type: "refresh_token",
-    refresh_token: process.env.SF_SERVICE_REFRESH_TOKEN,
+    refresh_token: held.refresh,
     client_id: process.env.SF_SERVICE_CLIENT_ID || process.env.SF_CLIENT_ID,
     client_secret: process.env.SF_SERVICE_CLIENT_SECRET || process.env.SF_CLIENT_SECRET,
   });
@@ -464,13 +523,29 @@ async function serviceToken(force) {
     method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body,
     signal: AbortSignal.timeout(SF_TIMEOUT_MS),
   });
-  if (!r.ok) { console.error("service-account refresh failed:", r.status, await r.text()); svcTok = null; return null; }
+  if (!r.ok) {
+    const raw = await r.text();
+    let parsed = null; try { parsed = JSON.parse(raw); } catch { /* not json */ }
+    svcLastErr = {
+      status: r.status,
+      error: (parsed && parsed.error) || null,
+      description: (parsed && parsed.error_description) || null,
+      seeded: held.seeded, rotations: held.rotations, at: Date.now(),
+    };
+    console.error("service-account refresh failed:", r.status, raw,
+      held.seeded ? "(using the SF_SERVICE_REFRESH_TOKEN bootstrap)" : `(using the stored token, ${held.rotations} rotations)`);
+    svcTok = null; return null;
+  }
   const t = await r.json();
-  svcTok = {
-    access_token: t.access_token,
-    instance_url: t.instance_url || process.env.SF_SERVICE_INSTANCE_URL || "",
-    at: Date.now(),
-  };
+  const instance = t.instance_url || held.instance || process.env.SF_SERVICE_INSTANCE_URL || "";
+  // Persist BEFORE returning, and whether or not Salesforce rotated: t.refresh_token is absent
+  // when it did not, in which case the one we hold is still the live one and re-storing it is a
+  // harmless no-op that also seeds the row on the bootstrap run.
+  const next = t.refresh_token || held.refresh;
+  await sfServiceStore(next, held.rotations + (t.refresh_token && t.refresh_token !== held.refresh ? 1 : 0), instance,
+    held.seeded ? "seeded from SF_SERVICE_REFRESH_TOKEN" : "rotated on refresh");
+  svcLastErr = null;
+  svcTok = { access_token: t.access_token, instance_url: instance, at: Date.now() };
   return svcTok.instance_url ? svcTok : null;
 }
 
@@ -496,56 +571,39 @@ async function serviceToken(force) {
 // self-diagnose, and gating it on SF_ALLOWED_ROLES would exclude exactly them. Nothing here is
 // secret — an HTTP status, Salesforce's own error code, and the identity the grant belongs to.
 app.get("/api/salesforce/service-status", requireSession, async (req, res) => {
-  if (!process.env.SF_SERVICE_REFRESH_TOKEN) {
+  // Goes through serviceToken(), the SAME path the summary route uses, so it reports on the token
+  // that actually serves users — and so the rotated token it produces is PERSISTED. An endpoint
+  // that refreshed on its own would invalidate the live grant every time someone checked.
+  const stored = await sfServiceRefreshToken();
+  if (!stored) {
     return res.json({ configured: false, ok: false,
-      detail: "SF_SERVICE_REFRESH_TOKEN is not set — only users with their own Salesforce connection can read opportunities." });
+      detail: "No service refresh token is stored and SF_SERVICE_REFRESH_TOKEN is unset — run authorize-service.js and set it once to seed the store." });
   }
-  const body = new URLSearchParams({
-    grant_type: "refresh_token",
-    refresh_token: process.env.SF_SERVICE_REFRESH_TOKEN,
-    client_id: process.env.SF_SERVICE_CLIENT_ID || process.env.SF_CLIENT_ID,
-    client_secret: process.env.SF_SERVICE_CLIENT_SECRET || process.env.SF_CLIENT_SECRET,
-  });
-  const usingServiceApp = !!process.env.SF_SERVICE_CLIENT_ID;
-  let r;
-  try {
-    r = await fetch(`${process.env.SF_LOGIN_URL}/services/oauth2/token`, {
-      method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body,
-      signal: AbortSignal.timeout(SF_TIMEOUT_MS),
-    });
-  } catch (e) {
-    return res.json({ configured: true, ok: false, reached: false, usingServiceApp,
-      loginUrl: process.env.SF_LOGIN_URL || null,
-      detail: `Could not reach the Salesforce token endpoint: ${e && e.name} ${e && e.message}` });
+  const tok = await serviceToken(false);
+  if (tok) {
+    let who = null;
+    try {
+      const wr = await fetch(`${tok.instance_url}/services/oauth2/userinfo`, {
+        headers: { Authorization: `Bearer ${tok.access_token}` },
+        signal: AbortSignal.timeout(SF_TIMEOUT_MS),
+      });
+      if (wr.ok) { const u = await wr.json(); who = (u && (u.preferred_username || u.email || u.name)) || null; }
+    } catch { /* the token is the point; the identity is a nicety */ }
+    const { data } = await supabaseAdmin.from("integration_tokens")
+      .select("rotated_count, updated_at").eq("provider", SF_SVC_PROVIDER).maybeSingle();
+    return res.json({ configured: true, ok: true, identity: who, instance: tok.instance_url,
+      seeded: stored.seeded,
+      rotations: (data && data.rotated_count) || 0,
+      lastRotated: (data && data.updated_at) || null,
+      detail: "The service account can obtain a token, so every user should be able to read opportunity summaries. If one cannot, the failure is on the query rather than the connection." });
   }
-  let payload = null;
-  try { payload = await r.json(); } catch { /* Salesforce answered with something other than json */ }
-  if (!r.ok) {
-    // Salesforce's own error code is the useful part: invalid_grant means the refresh token has
-    // been revoked or expired, invalid_client means the id/secret belong to a different app.
-    return res.json({ configured: true, ok: false, reached: true, usingServiceApp,
-      status: r.status,
-      error: (payload && payload.error) || null,
-      description: (payload && payload.error_description) || null,
-      detail: "Salesforce refused the service-account refresh. invalid_grant = the token was revoked or expired (re-issue it from the connected app). invalid_client = SF_SERVICE_CLIENT_ID/SECRET belong to a different app than the one that minted the token." });
-  }
-  const instance = (payload && payload.instance_url) || process.env.SF_SERVICE_INSTANCE_URL || "";
-  if (!instance) {
-    return res.json({ configured: true, ok: false, reached: true, usingServiceApp,
-      noInstanceUrl: true,
-      detail: "The refresh SUCCEEDED but no instance_url came back and SF_SERVICE_INSTANCE_URL is unset. serviceToken() returns null in this case WITHOUT logging anything, so the route 503s with no trace. Set SF_SERVICE_INSTANCE_URL to the org's My Domain URL." });
-  }
-  // Confirm WHICH identity the grant belongs to — this is meant to be Nathan's account.
-  let who = null;
-  try {
-    const wr = await fetch(`${instance}/services/oauth2/userinfo`, {
-      headers: { Authorization: `Bearer ${payload.access_token}` },
-      signal: AbortSignal.timeout(SF_TIMEOUT_MS),
-    });
-    if (wr.ok) { const u = await wr.json(); who = u && (u.preferred_username || u.email || u.name) || null; }
-  } catch { /* the token is what matters; the identity is a nicety */ }
-  res.json({ configured: true, ok: true, reached: true, usingServiceApp, instance, identity: who,
-    detail: "The service account can obtain a token. Every user should be able to read opportunity summaries; if one cannot, the failure is on the query, not the connection." });
+  const e = svcLastErr || {};
+  res.json({ configured: true, ok: false,
+    status: e.status || null, error: e.error || null, description: e.description || null,
+    seeded: stored.seeded, rotations: stored.rotations,
+    detail: e.error === "invalid_grant"
+      ? "Salesforce rejected the stored refresh token. With refresh-token rotation enforced on the External Client App, this means the stored token is no longer the current one — re-issue with authorize-service.js and set SF_SERVICE_REFRESH_TOKEN once to reseed. If it recurs, the rotated token is not being persisted; check the logs for 'could not persist the rotated service refresh token'."
+      : "Salesforce refused the service-account refresh. See status/error above; the backend logs carry the full response." });
 });
 
 app.get("/api/salesforce/opportunity-summary", requireSession, rateLimit({ perMin: RATE_PER_MIN, perDay: RATE_PER_DAY, action: "opp_summary" }), async (req, res) => {
