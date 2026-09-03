@@ -474,6 +474,80 @@ async function serviceToken(force) {
   return svcTok.instance_url ? svcTok : null;
 }
 
+// Is the SERVICE ACCOUNT working? Read-only, no secrets in the response.
+//
+// Added 2026-09-03: Casey (admin, no Salesforce connection of his own) saw "Couldn't reach
+// Salesforce" on the discrepancy register. The service-account fallback below is exactly what is
+// meant to serve him, and every environment variable it needs is present, so the failure is at
+// run time — and the only record of WHY was a console line in Render. DevTools is blocked on Jed's
+// machine, so a URL he can open is the practical instrument. Same reasoning as logging the
+// takeoff's hub-link attempts to a table instead of the console.
+//
+// It reports the three outcomes serviceToken() collapses into one null:
+//
+//   configured:false            SF_SERVICE_REFRESH_TOKEN is not set
+//   ok:false + status/error     Salesforce refused the refresh (invalid_grant, bad client, …)
+//   ok:false + noInstanceUrl    the refresh SUCCEEDED but returned no instance_url and
+//                               SF_SERVICE_INSTANCE_URL is unset — serviceToken returns null here
+//                               and logs NOTHING, so this case was invisible
+//   ok:true                     a token was obtained; whoami says which Salesforce identity it is
+//
+// requireSession, not requireUser: the point is that a user with NO Salesforce access can
+// self-diagnose, and gating it on SF_ALLOWED_ROLES would exclude exactly them. Nothing here is
+// secret — an HTTP status, Salesforce's own error code, and the identity the grant belongs to.
+app.get("/api/salesforce/service-status", requireSession, async (req, res) => {
+  if (!process.env.SF_SERVICE_REFRESH_TOKEN) {
+    return res.json({ configured: false, ok: false,
+      detail: "SF_SERVICE_REFRESH_TOKEN is not set — only users with their own Salesforce connection can read opportunities." });
+  }
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: process.env.SF_SERVICE_REFRESH_TOKEN,
+    client_id: process.env.SF_SERVICE_CLIENT_ID || process.env.SF_CLIENT_ID,
+    client_secret: process.env.SF_SERVICE_CLIENT_SECRET || process.env.SF_CLIENT_SECRET,
+  });
+  const usingServiceApp = !!process.env.SF_SERVICE_CLIENT_ID;
+  let r;
+  try {
+    r = await fetch(`${process.env.SF_LOGIN_URL}/services/oauth2/token`, {
+      method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body,
+      signal: AbortSignal.timeout(SF_TIMEOUT_MS),
+    });
+  } catch (e) {
+    return res.json({ configured: true, ok: false, reached: false, usingServiceApp,
+      loginUrl: process.env.SF_LOGIN_URL || null,
+      detail: `Could not reach the Salesforce token endpoint: ${e && e.name} ${e && e.message}` });
+  }
+  let payload = null;
+  try { payload = await r.json(); } catch { /* Salesforce answered with something other than json */ }
+  if (!r.ok) {
+    // Salesforce's own error code is the useful part: invalid_grant means the refresh token has
+    // been revoked or expired, invalid_client means the id/secret belong to a different app.
+    return res.json({ configured: true, ok: false, reached: true, usingServiceApp,
+      status: r.status,
+      error: (payload && payload.error) || null,
+      description: (payload && payload.error_description) || null,
+      detail: "Salesforce refused the service-account refresh. invalid_grant = the token was revoked or expired (re-issue it from the connected app). invalid_client = SF_SERVICE_CLIENT_ID/SECRET belong to a different app than the one that minted the token." });
+  }
+  const instance = (payload && payload.instance_url) || process.env.SF_SERVICE_INSTANCE_URL || "";
+  if (!instance) {
+    return res.json({ configured: true, ok: false, reached: true, usingServiceApp,
+      noInstanceUrl: true,
+      detail: "The refresh SUCCEEDED but no instance_url came back and SF_SERVICE_INSTANCE_URL is unset. serviceToken() returns null in this case WITHOUT logging anything, so the route 503s with no trace. Set SF_SERVICE_INSTANCE_URL to the org's My Domain URL." });
+  }
+  // Confirm WHICH identity the grant belongs to — this is meant to be Nathan's account.
+  let who = null;
+  try {
+    const wr = await fetch(`${instance}/services/oauth2/userinfo`, {
+      headers: { Authorization: `Bearer ${payload.access_token}` },
+      signal: AbortSignal.timeout(SF_TIMEOUT_MS),
+    });
+    if (wr.ok) { const u = await wr.json(); who = u && (u.preferred_username || u.email || u.name) || null; }
+  } catch { /* the token is what matters; the identity is a nicety */ }
+  res.json({ configured: true, ok: true, reached: true, usingServiceApp, instance, identity: who,
+    detail: "The service account can obtain a token. Every user should be able to read opportunity summaries; if one cannot, the failure is on the query, not the connection." });
+});
+
 app.get("/api/salesforce/opportunity-summary", requireSession, rateLimit({ perMin: RATE_PER_MIN, perDay: RATE_PER_DAY, action: "opp_summary" }), async (req, res) => {
   const id = String(req.query.id || "").trim();
   const gpField = String(req.query.gpField || "").trim();
