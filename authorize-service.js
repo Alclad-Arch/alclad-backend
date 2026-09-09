@@ -29,6 +29,14 @@
 //   • its callback URL set to exactly http://localhost:3001/api/oauth/callback
 //   • ~10 minutes elapsed since you saved it (Salesforce propagation)
 //
+// ⚠ IT WRITES TO WHATEVER SUPABASE_URL POINTS AT — which in this repo's .env is DEV, not prod.
+//    Jed hit that on 2026-09-09: the write failed with "table not in the schema cache" because
+//    dev has never had 20260903_integration_tokens.sql run against it. To fix the PROD grant,
+//    delete prod's row so the env-var bootstrap is reachable, run this for the token, and set
+//    SF_SERVICE_REFRESH_TOKEN on Render — the server then persists the rotation into prod itself,
+//    sealed with prod's own TOKEN_ENC_KEY, which is where it belongs. Pointing this script at
+//    prod would mean prod's service-role key sitting in a local .env, which is worse.
+//
 // Sign in to Salesforce as the account that will hold the licence BEFORE running this,
 // or sign in when the browser opens — whoever approves is the identity every unlinked
 // app user will read Salesforce as.
