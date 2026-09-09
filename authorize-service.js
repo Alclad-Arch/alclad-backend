@@ -3,9 +3,25 @@
 //   node authorize-service.js
 //
 // Runs the OAuth authorization-code flow once against the connected app you created for
-// the service, prints the refresh token and instance URL, and exits. It writes NOTHING —
-// no file, no database row — so the only copy of the token is the one you paste into
-// Render. Nothing here is wired into the running server.
+// the service, then WRITES THE TOKEN STRAIGHT INTO integration_tokens — the same row the
+// server reads — and prints it as well.
+//
+// ── WHY IT WRITES NOW (2026-09-09) ──
+// It used to only print, on the reasoning that the terminal should be the token's only copy.
+// That made the documented recovery impossible in the state it is most needed. Look at the
+// order in sfServiceRefreshToken(): the STORED ROW WINS, and the env var is only read when
+// no row exists. So once integration_tokens holds a salesforce_service row — which it does
+// as soon as the first refresh rotates — re-issuing and setting SF_SERVICE_REFRESH_TOKEN
+// does NOTHING. The fresh token sits in the env var, unread, while the dead stored one keeps
+// being sent to Salesforce and rejected as invalid_grant.
+//
+// That is what happened on 2026-09-03 and again on 2026-09-09: the same fix applied twice,
+// appearing to work and then not, because the second time there was a row in the way. The
+// error message the app shows still said "set SF_SERVICE_REFRESH_TOKEN once to reseed",
+// which cannot work with a row present.
+//
+// So the token now goes where the server will actually read it. The env var remains as the
+// cold-start bootstrap for a database that has never held a row.
 //
 // Prerequisites (see docs/salesforce-service-account.md in the app repo):
 //   • a Connected App created for the SERVICE, separate from the per-user login app —
@@ -21,6 +37,8 @@ import crypto from "crypto";
 import http from "http";
 import readline from "readline/promises";
 import { stdin as input, stdout as output } from "node:process";
+import { createClient } from "@supabase/supabase-js";
+import { loadKey, seal as sealWith } from "./tokenCrypto.js";
 
 const PORT = 3001;
 const REDIRECT = `http://localhost:${PORT}/api/oauth/callback`;
@@ -91,14 +109,61 @@ if (!r.ok || !t.refresh_token) {
   rl.close(); process.exit(1);
 }
 
+// ── write it where the server reads it ──────────────────────────────────────────────────────
+// Sealed exactly as server.js does (seal(token, SF_SVC_SEAL_ID) with TOKEN_ENC_KEY), because the
+// server unseals with the same id — a mismatch there stores a token nothing can open, which reads
+// as "could not be decrypted" and silently falls back to the stale env var. Plaintext when no key
+// is set, which the server's isSealed() check already tolerates.
+let stored = false;
+const SUPA_URL = process.env.SUPABASE_URL;
+const SUPA_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!SUPA_URL || !SUPA_KEY) {
+  console.warn("\n⚠ SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set here, so the token was NOT stored.");
+  console.warn("  Set them in this repo's .env and re-run, or delete the stored row so the env var");
+  console.warn("  bootstrap below is reachable:");
+  console.warn("    delete from public.integration_tokens where provider = 'salesforce_service';");
+} else {
+  const key = loadKey(process.env.TOKEN_ENC_KEY);
+  const value = key ? sealWith(t.refresh_token, "salesforce_service", key) : t.refresh_token;
+  const supa = createClient(SUPA_URL, SUPA_KEY, { auth: { persistSession: false } });
+  /* rotated_count RESET TO 0, deliberately: this is a new grant, and the count is the health
+     signal for how many times THIS grant has rotated. Carrying the old number forward would make
+     a fresh, never-refreshed token look like a working one. */
+  const { error } = await supa.from("integration_tokens").upsert({
+    provider: "salesforce_service",
+    refresh_token: value,
+    rotated_count: 0,
+    meta: { instance: t.instance_url || "", note: "re-issued by authorize-service.js" },
+    updated_at: new Date().toISOString(),
+    updated_by: "authorize-service.js",
+  });
+  if (error) {
+    console.error("\n⚠ Could not store the token:", error.message);
+    console.error("  The token below is still valid — set it on Render, and delete the stored row");
+    console.error("  first or the server will keep reading the old one:");
+    console.error("    delete from public.integration_tokens where provider = 'salesforce_service';");
+  } else {
+    stored = true;
+    console.log("\n✓ Stored in integration_tokens (provider = salesforce_service)" + (key ? ", sealed." : ", PLAINTEXT — TOKEN_ENC_KEY is not set here."));
+    console.log("  The server reads this row in preference to the environment variable, so it is");
+    console.log("  live as soon as it next asks for a token.");
+  }
+}
+
 console.log("\n" + "=".repeat(72));
-console.log("Set these on Render (alclad-backend → Environment), then let it redeploy:\n");
+console.log(stored
+  ? "Already stored. Set these on Render too, as the cold-start bootstrap:\n"
+  : "Set these on Render (alclad-backend → Environment), then let it redeploy:\n");
 console.log(`SF_SERVICE_REFRESH_TOKEN=${t.refresh_token}`);
 console.log(`SF_SERVICE_INSTANCE_URL=${t.instance_url || ""}`);
 console.log(`SF_SERVICE_CLIENT_ID=${clientId}`);
 console.log(`SF_SERVICE_CLIENT_SECRET=${clientSecret}`);
 console.log("=".repeat(72));
 console.log("\nTreat the refresh token as a password: it is a standing login to Salesforce");
-console.log("as whoever just approved. Nothing was written to disk — this terminal is the");
-console.log("only copy, so clear the scrollback once it's in Render.\n");
+console.log("as whoever just approved. Clear the scrollback once it is in Render.\n");
+if (stored) {
+  console.log("Check it with /api/salesforce/service-status — expect ok:true, seeded:false, and");
+  console.log("rotations climbing over the next day. A flatlined count means refresh has stopped");
+  console.log("and the grant is drifting toward its 30-day idle expiry.\n");
+}
 rl.close();
