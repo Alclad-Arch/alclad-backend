@@ -19,6 +19,11 @@ import {
 } from "./myobOdataRead.js";
 
 const dry = process.argv.includes("--dry-run");
+/* --guard applies the same once-a-day rule the scheduler uses, read from max(synced_at) in the
+   data. For a Render Cron Job that has its own schedule this is unnecessary; for a cron running
+   ALONGSIDE the in-process scheduler, or a hand-run you want to be safe, it prevents a second
+   Acumatica session. A bare run is never second-guessed. */
+const guard = process.argv.includes("--guard");
 
 const need = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"];
 const missing = need.filter((k) => !process.env[k]);
@@ -104,7 +109,14 @@ try {
     for (const [p, amt] of top) console.log(`  ${p.padEnd(12)} ${amt.toFixed(2)}`);
     console.log("\nNothing was written. Re-run without --dry-run to sync.\n");
   } else {
-    const out = await syncActuals(db, { env: process.env });
+    const out = await syncActuals(db, { env: process.env, guard });
+    if (out.skipped) {
+      /* A SKIP IS NOT A FAILURE, and must not read like one or exit non-zero — a cron wrapper that
+         treats it as an error will email about a healthy feed every night. */
+      console.log(`\nSKIPPED — ${out.reason}`);
+      console.log(`last sync ${out.lastSyncedAt || "never"}. Re-run without --guard to force one.\n`);
+      process.exit(0);
+    }
     console.log(`\nread    ${out.read} ledger row(s) in ${out.requests} request(s)${out.sessionReused ? " (one session)" : ""}`);
     console.log(`rolled  ${out.rolled} figure(s) from ${out.ledgerRows} ledger line(s)`);
     console.log(`written ${out.written}`);

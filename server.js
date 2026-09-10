@@ -29,6 +29,8 @@ import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
 import { loadKey, isSealed, seal as sealWith, unseal as unsealWith } from "./tokenCrypto.js";
 import { buildSummaryQuery, shapeSummary } from "./oppSummary.js";
+import { syncActuals } from "./syncMyobActuals.js";
+import { schedulerEnabled, startupJitterMs, CHECK_MS } from "./syncSchedule.js";
 
 const app = express();
 
@@ -756,8 +758,53 @@ async function encryptTokensAtRest() {
   if (skipped) console.error(`[security] ${skipped} token(s) could NOT be encrypted — check the logs above`);
 }
 
+/* ── THE NIGHTLY MYOB ACTUALS SYNC ────────────────────────────────────────────────────────────
+ *
+ * OFF unless MYOB_SYNC_SCHEDULE=1. Deploying this must not start making requests against a live
+ * ERP by surprise, and a Render Cron Job — which is the tidier arrangement, being isolated from
+ * the web service and having its own run history — must be usable without both firing.
+ *
+ * NOT A CRON EXPRESSION. It checks hourly and syncs when the DATA is older than 20 hours, so a
+ * missed window is caught on the next tick instead of waited out for a day, and a deploy at 03:00
+ * does not skip. The "have we already run" decision is read from max(synced_at) inside
+ * syncActuals, not held here: this timer re-arms on every restart and exists once per instance, so
+ * its own memory is worth nothing. Two instances both tick, both ask the database, and the second
+ * finds a fresh stamp and stops before opening a session.
+ *
+ * WHY THAT MATTERS MORE THAN A WASTED REQUEST: a Basic-auth request creates an Acumatica session,
+ * and the licence counts sessions, not requests. Syncing twice is a step towards locking real
+ * people out of MYOB.
+ *
+ * The sync never throws into the timer — a failure is logged loudly and the next tick tries again.
+ * Nothing is written on failure and the sweep cannot run, so a bad night leaves yesterday's
+ * figures in place, which the Integrations panel then reports as stale. */
+function startActualsSchedule() {
+  if (!schedulerEnabled()) {
+    console.log("[myob] actuals schedule OFF (set MYOB_SYNC_SCHEDULE=1 to enable, or use a Render Cron Job)");
+    return;
+  }
+  const tick = async () => {
+    try {
+      const out = await syncActuals(supabaseAdmin, { guard: true });
+      if (out.skipped) console.log(`[myob] actuals sync skipped — ${out.reason}`);
+      else console.log(`[myob] actuals synced: ${out.written} figure(s) from ${out.read} ledger row(s)`
+        + `, swept ${out.swept}, as ${out.as}`);
+    } catch (e) {
+      /* Named loudly and with the status, because the failure this most needs to survive is the
+         MYOB password changing on the account it borrows — and the whole point of the health panel
+         is that such a failure is not silent for days, the way the Salesforce one was. */
+      console.error(`[myob] actuals sync FAILED${e && e.status ? ` (HTTP ${e.status})` : ""}: ${(e && e.message) || e}`);
+    }
+  };
+  const jitter = startupJitterMs();
+  console.log(`[myob] actuals schedule ON — first check in ${Math.round(jitter / 60000)} min, then hourly`);
+  /* unref so this timer can never hold the process open during a shutdown. */
+  setTimeout(() => { tick(); setInterval(tick, CHECK_MS).unref(); }, jitter).unref();
+}
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Backend running on :${PORT}`);
   encryptTokensAtRest().catch((e) => console.error("[security] token sweep threw:", e && e.message));
+  startActualsSchedule();
 });

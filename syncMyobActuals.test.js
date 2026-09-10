@@ -287,3 +287,75 @@ test("both reads share ONE session", async () => {
   assert.equal(seen[0].inquiry, GROUPS_INQUIRY, "classification first — without it nothing is safe to store");
   assert.equal(seen[1].cookie, "SESS=1", "the ledger read reuses the session the first one opened");
 });
+
+// ── the daily guard ───────────────────────────────────────────────────────
+/* A scheduler's memory is not a guard: a web-service timer re-arms on every restart and exists once
+   per instance, so N instances mean N syncs and N Acumatica sessions. Sessions are what the licence
+   counts, so a double-run is a step towards locking real people out of MYOB. The decision therefore
+   comes from max(synced_at) in the data, which is shared and survives restarts. */
+const dbWithLastSync = (iso) => {
+  const base = fakeDb();
+  const orig = base.from.bind(base);
+  base.from = (table) => {
+    const t = orig(table);
+    t.select = (cols) => ({
+      order: () => ({ limit: async () => ({ data: iso === undefined ? [] : [{ synced_at: iso }], error: null }) }),
+    });
+    return t;
+  };
+  return base;
+};
+
+test("guard OFF by default — a deliberate run is never silently skipped", async () => {
+  /* Someone at a terminal, or a cron job with a schedule of its own, must not be second-guessed. */
+  const out = await syncActuals(fakeDb(), {
+    creds: CREDS, read: oneRead([{ Project: "6931", AccountGroup: "STAFF", Amount: 1 }]),
+  });
+  assert.equal(out.skipped, false);
+  assert.equal(out.written, 1);
+});
+
+test("guard ON skips when the data says it already ran today", async () => {
+  const db = dbWithLastSync(new Date(Date.now() - 2 * 3600000).toISOString());
+  let readCalled = false;
+  const out = await syncActuals(db, {
+    creds: CREDS, guard: true,
+    read: async () => { readCalled = true; return { rows: [], requests: 1, complete: true }; },
+  });
+  assert.equal(out.skipped, true);
+  assert.match(out.reason, /under the 20h minimum/);
+  /* NOT ONE REQUEST TO MYOB. The guard has to decide before the session is opened, or it has
+     already cost the thing it exists to protect. */
+  assert.equal(readCalled, false, "MYOB must not be contacted at all");
+  assert.equal(out.requests, 0);
+});
+
+test("guard ON runs when the last sync is old", async () => {
+  const db = dbWithLastSync(new Date(Date.now() - 30 * 3600000).toISOString());
+  const out = await syncActuals(db, {
+    creds: CREDS, guard: true,
+    read: oneRead([{ Project: "6931", AccountGroup: "STAFF", Amount: 1 }]),
+  });
+  assert.equal(out.skipped, false);
+  assert.equal(out.written, 1);
+});
+
+test("guard ON runs when nothing has ever synced", async () => {
+  /* An empty table means every linked project shows no cost; waiting for a window helps nobody. */
+  const out = await syncActuals(dbWithLastSync(undefined), {
+    creds: CREDS, guard: true,
+    read: oneRead([{ Project: "6931", AccountGroup: "STAFF", Amount: 1 }]),
+  });
+  assert.equal(out.skipped, false);
+  assert.equal(out.written, 1);
+});
+
+test("a skip is shaped like a result, not an exception", async () => {
+  /* A caller should not have to tell a decision from a failure — the scheduler logs both. */
+  const db = dbWithLastSync(new Date().toISOString());
+  const out = await syncActuals(db, { creds: CREDS, guard: true, read: oneRead([]) });
+  for (const k of ['read', 'rolled', 'written', 'swept', 'requests']) {
+    assert.equal(out[k], 0, `${k} should be 0 on a skip`);
+  }
+  assert.equal(out.swept, 0, 'and above all it must not sweep');
+});

@@ -19,9 +19,24 @@ import {
   ACTUALS_INQUIRY, ACTUALS_SELECT, ACTUALS_ORDER, GROUPS_INQUIRY, GROUPS_SELECT,
 } from "./myobOdataRead.js";
 import { readOdataCreds } from "./myobOdataCreds.js";
+import { shouldRunNow } from "./syncSchedule.js";
 
 export const TABLE = "myob_actuals";
 export const CHUNK = 500;
+
+/* When did the last successful sync finish? max(synced_at) — every run stamps every row it writes,
+ * so the data records its own freshness and no separate bookkeeping can drift from it.
+ *
+ * Ordering by synced_at descending and taking one row rather than an aggregate: PostgREST has no
+ * clean max(), and with an index on synced_at this is a single row read. Returns null for an empty
+ * table, which the caller must read as "never synced" and NOT as an error. */
+export async function lastSyncedAt(db) {
+  const { data, error } = await db.from(TABLE)
+    .select("synced_at").order("synced_at", { ascending: false }).limit(1);
+  if (error) throw new Error(`could not read the last sync time: ${error.message}`);
+  const row = Array.isArray(data) ? data[0] : null;
+  return row ? row.synced_at : null;
+}
 
 /* Split for upserting. Exported because the boundary conditions (an exact multiple, a single row,
    nothing at all) are where an off-by-one silently drops the last chunk. */
@@ -67,7 +82,29 @@ export async function syncActuals(db, {
   read = readInquiry,
   creds: given = null,
   now = () => new Date().toISOString(),
+  /* THE DAILY GUARD. Default OFF so a deliberate run — someone at a terminal, a Render cron job on
+     a schedule of its own — is never silently skipped. Anything that fires REPEATEDLY passes true,
+     and then the decision comes from max(synced_at) in the data rather than from that caller's
+     memory of whether it has run.
+
+     It lives here, not in the scheduler, because a guard in the scheduler protects only that
+     scheduler: a second web-service instance, a redeploy, or a hand-run alongside a cron would each
+     open another Acumatica session, and sessions are what the licence counts. */
+  guard = false,
+  minHours = undefined,
 } = {}) {
+  if (guard) {
+    const last = await lastSyncedAt(db);
+    const verdict = shouldRunNow({ lastSyncedAt: last, ...(minHours != null ? { minHours } : {}) });
+    if (!verdict.run) {
+      /* A SKIP IS A RESULT, not a failure — reported in the same shape so a caller does not have to
+         tell an exception from a decision. */
+      return {
+        skipped: true, reason: verdict.reason, lastSyncedAt: last,
+        read: 0, rolled: 0, written: 0, swept: 0, requests: 0, complete: null,
+      };
+    }
+  }
   const creds = given || await readOdataCreds(db, env);
   const syncedAt = now();
 
@@ -131,6 +168,7 @@ export async function syncActuals(db, {
   }
 
   return {
+    skipped: false,
     read: rows.length,
     rolled: rolled.length,
     written,
