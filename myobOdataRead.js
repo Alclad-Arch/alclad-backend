@@ -219,41 +219,67 @@ export function unknownGroups(rows = [], byCode = new Map()) {
   return [...seen].sort();
 }
 
-export function rollUpActuals(rows = [], { costGroups = null } = {}) {
+export function rollUpActuals(rows = [], { costGroups = null, incomeGroups = null } = {}) {
   const by = new Map();
   for (const r of rows) {
     const project = String(r.Project ?? '').trim();
     if (!project) continue;              // a row with no project cannot be attributed to anything
-    /* COST ONLY. Passing no set means no filtering, which is right for a caller that has already
-       filtered and wrong for the sync — syncActuals always passes one. */
-    if (costGroups && !costGroups.has(String(r.AccountGroup ?? '').trim())) continue;
+    const group = String(r.AccountGroup ?? '').trim();
+    /* COST AND INCOME ARE BOTH KEPT, in separate columns.
+     *
+     * Passing neither set means no filtering, which suits a caller that has already filtered and
+     * would be wrong for the sync — syncActuals always passes both. Passing costGroups alone keeps
+     * the old cost-only behaviour, so nothing that predates income has to change.
+     *
+     * A row in NEITHER set is dropped here. syncActuals refuses the whole run when an unclassified
+     * group appears, so reaching this line means the caller chose to filter loosely and is
+     * responsible for that. */
+    const isCost = !costGroups || costGroups.has(group);
+    const isIncome = !!incomeGroups && incomeGroups.has(group);
+    if (!isCost && !isIncome) continue;
     const costCode = String(r.CostCode ?? '').trim();
     const period = String(r.FinPeriod ?? '').trim();
     const key = `${project}|${costCode}|${period}`;
     const cur = by.get(key) || {
-      project_id: project, cost_code: costCode, account_group: String(r.AccountGroup ?? '').trim(),
+      project_id: project, cost_code: costCode, account_group: group,
       /* MYOB's own description of the job. Blank rather than null so a reader never has to handle
          both, and first-seen-wins: if the name were edited mid-period the figures are the same job
          either way, and the linker only needs it to recognise siblings. */
       project_name: String(r.ProjectName ?? '').trim(),
-      fin_period: period, actual_amount: 0, actual_qty: 0, rows: 0,
+      fin_period: period, actual_amount: 0, income_amount: 0, actual_qty: 0, rows: 0,
     };
     /* A later row can fill a name an earlier one lacked, but never blank one that is already set. */
     if (!cur.project_name) cur.project_name = String(r.ProjectName ?? '').trim();
+    /* THE ACCOUNT GROUP ON A MIXED ROW. One project/cost-code/period can carry both cost and
+       income lines, and a single column cannot describe both — so a mixed row is labelled from the
+       COST side, which is what the register's figure is about. The view exposes the full set of
+       groups behind a project anyway, and income_amount being non-zero says the rest. */
+    if (isCost && !cur.account_group_is_cost) { cur.account_group = group; cur.account_group_is_cost = true; }
     /* Number(null) is 0 but Number(undefined) is NaN, and a NaN poisons the whole sum silently —
        so anything unparseable contributes nothing rather than destroying the total. */
     const amt = Number(r.Amount);
     const qty = Number(r.Qty);
-    cur.actual_amount += Number.isFinite(amt) ? amt : 0;
-    cur.actual_qty += Number.isFinite(qty) ? qty : 0;
+    const n = Number.isFinite(amt) ? amt : 0;
+    if (isCost) {
+      cur.actual_amount += n;
+      cur.actual_qty += Number.isFinite(qty) ? qty : 0;
+    } else {
+      /* INCOME IS STORED POSITIVE. MYOB books project revenue as a CREDIT, so these arrive negative
+         — GLAZING summed to -52,503,187.06 across the ledger. The MYOB Projects screen shows
+         "Actual Income 6,466,337.95" as a positive figure, and a hub that showed -6,466,337.95
+         would invite someone to add it to cost rather than compare it. Negated once, here, at the
+         edge, for the same reason identifiers are trimmed here. */
+      cur.income_amount += -n;
+    }
     cur.rows += 1;
     by.set(key, cur);
   }
   /* Rounded to cents at the end, not per row: rounding each addend first is how a total drifts
      away from the ledger by a few cents per hundred lines. */
-  return [...by.values()].map((v) => ({
+  return [...by.values()].map(({ account_group_is_cost, ...v }) => ({
     ...v,
     actual_amount: Math.round(v.actual_amount * 100) / 100,
+    income_amount: Math.round(v.income_amount * 100) / 100,
     actual_qty: Math.round(v.actual_qty * 10000) / 10000,
   }));
 }

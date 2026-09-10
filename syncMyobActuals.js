@@ -66,6 +66,9 @@ export function toTableRows(rolled, syncedAt) {
     project_id: r.project_id,
     project_name: r.project_name || '',
     cost_code: r.cost_code,
+    /* Actual revenue INVOICED against the job, positive. Not the contract value, and not the same
+       thing as the hub's own sell figure — see the migration note. */
+    income_amount: r.income_amount || 0,
     account_group: r.account_group,
     fin_period: r.fin_period,
     actual_amount: r.actual_amount,
@@ -140,7 +143,7 @@ export async function syncActuals(db, {
     throw new Error(`ledger carries account group(s) not in ${GROUPS_INQUIRY}: ${strays.join(", ")} — refusing to sync`);
   }
 
-  const rolled = rollUpActuals(rows, { costGroups });
+  const rolled = rollUpActuals(rows, { costGroups, incomeGroups: income });
   const tableRows = toTableRows(rolled, syncedAt);
 
   let written = 0;

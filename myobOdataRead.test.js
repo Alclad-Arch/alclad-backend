@@ -290,3 +290,79 @@ test("a row with no account group is counted, not dropped", () => {
   assert.equal(g[0].account_group, "(none)");
   assert.equal(g[0].amount, 5);
 });
+
+// ── income, kept separately from cost ─────────────────────────────────────
+/* Alclad books revenue through account groups named after the PACKAGES and cost through groups
+   named by CATEGORY. Summing them together is what produced 10,734,945.75 on one project. Kept in
+   separate columns, the pair reconciles with the MYOB Projects screen: Actual Income against
+   Actual Expenses, and the Margin between them. */
+const COST = new Set(['MATERIAL', 'STAFF']);
+const INCOME = new Set(['GLAZING', 'CLADDING']);
+
+test("income lands in its own column, POSITIVE", () => {
+  /* MYOB books project revenue as a credit, so it arrives negative — GLAZING summed to
+     -52,503,187.06 across the ledger. The Projects screen shows Actual Income as a positive
+     figure, and a hub showing -6,466,337.95 would invite someone to add it to cost. */
+  const out = rollUpActuals([
+    { Project: '5454', CostCode: 'C', AccountGroup: 'MATERIAL', FinPeriod: 'P', Amount: 1000 },
+    { Project: '5454', CostCode: 'C', AccountGroup: 'GLAZING', FinPeriod: 'P', Amount: -5000 },
+  ], { costGroups: COST, incomeGroups: INCOME });
+  assert.equal(out.length, 1, 'one row per project/cost code/period, whatever the groups');
+  assert.equal(out[0].actual_amount, 1000);
+  assert.equal(out[0].income_amount, 5000, 'negated once, at the edge');
+});
+
+test("income does NOT net off cost", () => {
+  /* The whole bug, in one assertion. */
+  const out = rollUpActuals([
+    { Project: '5454', CostCode: 'C', AccountGroup: 'MATERIAL', FinPeriod: 'P', Amount: 4268607.80 },
+    { Project: '5454', CostCode: 'C', AccountGroup: 'GLAZING', FinPeriod: 'P', Amount: -6466337.95 },
+  ], { costGroups: COST, incomeGroups: INCOME });
+  assert.equal(out[0].actual_amount, 4268607.8, 'matches ACTUAL EXPENSES on the MYOB screen');
+  assert.equal(out[0].income_amount, 6466337.95, 'matches ACTUAL INCOME');
+  /* And the margin MYOB shows for 5454 falls out of the pair. */
+  assert.equal(Math.round((out[0].income_amount - out[0].actual_amount) * 100) / 100, 2197730.15);
+});
+
+test("a mixed row is labelled from the COST side", () => {
+  /* One column cannot describe both, and the register's figure is about cost. income_amount being
+     non-zero says the rest, and the view exposes every group behind a project anyway. */
+  const out = rollUpActuals([
+    { Project: '1', CostCode: 'C', AccountGroup: 'GLAZING', FinPeriod: 'P', Amount: -10 },
+    { Project: '1', CostCode: 'C', AccountGroup: 'STAFF', FinPeriod: 'P', Amount: 4 },
+  ], { costGroups: COST, incomeGroups: INCOME });
+  assert.equal(out[0].account_group, 'STAFF', 'even though the income row came first');
+  /* And the internal marker must not leak into the stored row. */
+  assert.equal('account_group_is_cost' in out[0], false);
+});
+
+test("an income-only project still gets a row", () => {
+  /* A job invoiced before any cost is booked is real — retention, a deposit, an early claim — and
+     dropping it would make the hub show nothing for a job with revenue against it. */
+  const out = rollUpActuals([
+    { Project: '9', CostCode: 'C', AccountGroup: 'CLADDING', FinPeriod: 'P', Amount: -800 },
+  ], { costGroups: COST, incomeGroups: INCOME });
+  assert.equal(out.length, 1);
+  assert.equal(out[0].actual_amount, 0);
+  assert.equal(out[0].income_amount, 800);
+});
+
+test("with no incomeGroups given, income is DROPPED — the old behaviour", () => {
+  /* Nothing that predates income has to change, and a caller that has not opted in cannot be
+     surprised by revenue appearing in its cost figures. */
+  const out = rollUpActuals([
+    { Project: '1', CostCode: 'C', AccountGroup: 'STAFF', FinPeriod: 'P', Amount: 5 },
+    { Project: '1', CostCode: 'C', AccountGroup: 'GLAZING', FinPeriod: 'P', Amount: -99 },
+  ], { costGroups: COST });
+  assert.equal(out[0].actual_amount, 5);
+  assert.equal(out[0].income_amount, 0);
+});
+
+test("income reversals net out, like cost ones", () => {
+  /* A credit note is booked as its own signed row. */
+  const out = rollUpActuals([
+    { Project: '1', CostCode: 'C', AccountGroup: 'GLAZING', FinPeriod: 'P', Amount: -5000 },
+    { Project: '1', CostCode: 'C', AccountGroup: 'GLAZING', FinPeriod: 'P', Amount: 5000 },
+  ], { costGroups: COST, incomeGroups: INCOME });
+  assert.equal(out[0].income_amount, 0);
+});
