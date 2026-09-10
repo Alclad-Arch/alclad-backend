@@ -107,28 +107,40 @@ export function shouldRunNow({
   if (hours < minHours) {
     return { run: false, reason: `synced ${hours.toFixed(1)}h ago, under the ${minHours}h floor`, hours };
   }
-  /* THE VALVE. Checked before the window so a run that has missed its window is not made to wait
-     for the next one. */
-  if (hours >= maxHours) {
-    return { run: true, reason: `last synced ${hours.toFixed(1)}h ago — past ${maxHours}h, syncing outside the window`, hours };
-  }
   const win = `${windowUtc[0]}:00–${windowUtc[1]}:00 UTC`;
-  if (!inWindow(now, windowUtc)) {
+  /* THE WINDOW FIRST, THEN THE VALVE — and the order matters for the REASON, not the decision.
+   *
+   * Checked valve-first, a run that was both stale AND inside the window reported "past 26h,
+   * syncing OUTSIDE the window" while sitting squarely inside it. Traced against the live schedule,
+   * that is exactly what the 13/09 01:50 run would have logged. A log line that misdescribes why it
+   * ran is how the next person concludes the window is broken and goes looking for a bug that is
+   * not there.
+   *
+   * Safe to reorder: "already synced in this window" implies the last run was inside a window at
+   * most five hours wide, so hours is under five and the valve could not have applied anyway. */
+  if (inWindow(now, windowUtc)) {
+    /* Has this window already had its sync? Anchoring to the window's OPENING rather than to the
+       last run is what stops the time drifting: whichever tick within the window gets there first
+       does the work, and every later tick sees a stamp newer than the opening and stops. It is also
+       what makes a second instance harmless. */
+    if (then >= windowStart(now, windowUtc)) {
+      return { run: false, reason: `already synced in this ${win} window`, hours };
+    }
+    return { run: true, reason: `in the ${win} window, last synced ${hours.toFixed(1)}h ago`, hours };
+  }
+  /* Outside it. The valve is what stops the window starving a service that sleeps through every
+     one — without it a preference becomes a bug. */
+  if (hours >= maxHours) {
     return {
-      run: false, hours,
-      /* Says what would change its mind, so a log full of these does not read as a stuck job. */
-      reason: `${hours.toFixed(1)}h old, waiting for the ${win} window (syncs anyway past ${maxHours}h)`,
+      run: true, hours,
+      reason: `${hours.toFixed(1)}h old and outside the ${win} window — past ${maxHours}h, syncing anyway`,
     };
   }
-  /* In the window — but has this window already had its sync? Anchoring to the window's OPENING
-     rather than to the last run is what stops the time drifting: whichever tick within the window
-     gets there first does the work, and every later tick in the same window sees a stamp newer than
-     the opening and stops. It is also what makes a second instance harmless. */
-  const opened = windowStart(now, windowUtc);
-  if (then >= opened) {
-    return { run: false, reason: `already synced in this ${win} window`, hours };
-  }
-  return { run: true, reason: `in the ${win} window, last synced ${hours.toFixed(1)}h ago`, hours };
+  return {
+    run: false, hours,
+    /* Says what would change its mind, so a log full of these does not read as a stuck job. */
+    reason: `${hours.toFixed(1)}h old, waiting for the ${win} window (syncs anyway past ${maxHours}h)`,
+  };
 }
 
 /* A random delay before the first check, in ms.
