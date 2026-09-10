@@ -69,7 +69,19 @@ export const BUDGET_SELECT = [
    single page covers it, but an unordered read is undefined regardless of size. */
 export const BUDGET_ORDER = 'Project';
 
-/* Every column that is summed, mapped to its stored name. All additive — see the grain note. */
+/* Every column that is summed, mapped to its stored name. All additive — see the grain note.
+ *
+ * ⚠ ADDING ONE HERE NEEDS A MIGRATION. These names are written straight into
+ * public.myob_project_budget, so a field added here without a column added there fails the sync at
+ * the first upsert:
+ *
+ *     SYNC FAILED: myob_project_budget upsert failed after 0 row(s):
+ *     Could not find the 'forecast_gp' column of 'myob_project_budget' in the schema cache
+ *
+ * That happened on 2026-09-10 when ForecastGP was added after the table was written. It fails
+ * loudly and before either sweep, so nothing is lost — but it fails at 1am on a nightly run, and
+ * the hub then shows yesterday's figures until someone reads the log. A column here and a column
+ * there, in the same change. */
 const SUM_FIELDS = {
   BudgetRevenue: 'budget_revenue',
   ContractVariations: 'contract_variations',
