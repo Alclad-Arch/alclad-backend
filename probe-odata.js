@@ -53,12 +53,19 @@ const gi = gis[0] || "";
 /* How many rows to ask for. One is enough to learn the columns, which is the usual question;
    a few more is how you learn what the IDENTIFIERS look like — whether MYOB's ProjectID is the
    job number the hub uses. */
-const top = Math.max(1, Math.min(50, Number(process.env.MYOB_TOP || 1) || 1));
+const top = Math.max(1, Math.min(2000, Number(process.env.MYOB_TOP || 1) || 1));
 /* Rows are NOT printed unless asked for. The columns answer "can this inquiry feed the hub";
    the values are ledger figures, and putting those in a terminal by default serves nothing.
    MYOB_SHOW=1 prints them, for the one job it is genuinely needed for: working out how MYOB's
    ProjectID lines up with the hub's job numbers. */
 const show = process.env.MYOB_SHOW === "1";
+/* MYOB_FIND=6667,6931 prints ONLY the rows containing one of those strings.
+ *
+ * The mapping question — is the hub's job number MYOB's ProjectID — needs a needle from a few
+ * hundred rows, and MYOB_SHOW on a large $top answers it by burying it. Matching is done on the
+ * TRIMMED values because ProjectID comes back space-padded ("0018      "), which is exactly the
+ * kind of difference that makes a join quietly match nothing. */
+const finds = (process.env.MYOB_FIND || "").split(",").map((f) => f.trim()).filter(Boolean);
 const user = process.env.MYOB_ODATA_USER || "";
 const pass = process.env.MYOB_ODATA_PASS || "";
 
@@ -66,7 +73,7 @@ console.log(`\nMYOB OData probe — the surface an Excel add-in reads\n${instanc
 console.log(`tenant: ${tenants.length ? tenants.join(" | ") : "(unset — tenant-scoped addresses skipped, not guessed)"}`);
 console.log(`inquiry: ${gis.length ? gis.join(" | ") : "(unset — the service document still lists what is exposed)"}`);
 console.log(`credentials: ${user && pass ? `Basic as ${user}` : "NONE — set MYOB_ODATA_USER / MYOB_ODATA_PASS"}`);
-console.log(`rows: $top=${top}${show ? " · MYOB_SHOW=1, values will be printed" : " · columns only (MYOB_SHOW=1 to print values)"}`);
+console.log(`rows: $top=${top}${show ? " · MYOB_SHOW=1, values will be printed" : " · columns only (MYOB_SHOW=1 to print values)"}${finds.length ? ` · looking for ${finds.join(", ")}` : ""}`);
 
 /* Anonymous first, deliberately. If the service document answers without credentials that is
    worth knowing on its own — and it separates "this address exists" from "these credentials
@@ -95,6 +102,7 @@ const rows = [];
 const exposed = [];   // [label, [inquiry names]] for every catalogue that answered
 const columns = [];   // [label, [field names]] for every inquiry that returned a row
 const samples = [];   // [label, rows] only when MYOB_SHOW=1
+const matches = [];   // [label, hits, scanned] only when MYOB_FIND is set
 for (const [mode, header] of modes) {
   for (const t of passes) {
   for (const g of (gis.length ? gis : [""])) {
@@ -141,7 +149,14 @@ for (const [mode, header] of modes) {
           } else if (first && typeof first === 'object') {
             columns.push([label, Object.keys(first)]);
             detail = `${(j.value || []).length} row(s), ${Object.keys(first).length} column(s)`;
-            if (show) samples.push([label, j.value]);
+            if (finds.length) {
+              /* Trimmed on both sides, and matched against every value in the row rather than a
+                 named column: which column carries the identifier is part of what is being
+                 worked out. */
+              const hits = (j.value || []).filter((row) => Object.values(row).some((v) =>
+                finds.some((f) => String(v == null ? "" : v).trim().includes(f))));
+              matches.push([label, hits, (j.value || []).length]);
+            } else if (show) samples.push([label, j.value]);
           } else {
             /* 200 with NO rows is its own finding, not a blank: an inquiry that needs
                parameters answers exactly like this, and reading it as "empty" would write the
@@ -203,6 +218,17 @@ if (exposed.length) {
 for (const [label, cols] of columns) {
   console.log(`\nCOLUMNS of ${label} — ${cols.length}:`);
   console.log('  ' + cols.join(', '));
+}
+
+/* The needle, and how big the haystack was — "0 of 15" and "0 of 800" mean very different
+   things, and without the count the first reads as a definitive no. */
+for (const [label, hits, scanned] of matches) {
+  console.log(`\nFOUND in ${label} — ${hits.length} of ${scanned} row(s) scanned:`);
+  for (const h of hits) console.log('  ' + JSON.stringify(h));
+  if (!hits.length) {
+    console.log(`  none. If ${scanned} is the whole inquiry, these ids are not in it; if it is`);
+    console.log('  just the first page, raise MYOB_TOP and look again.');
+  }
 }
 
 for (const [label, rowsOut] of samples) {
