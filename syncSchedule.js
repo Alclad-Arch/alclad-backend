@@ -143,15 +143,27 @@ export function shouldRunNow({
   };
 }
 
-/* A random delay before the first check, in ms.
+/* A short random delay before the FIRST check, in ms — at most a minute.
  *
- * Two instances starting from the same deploy would otherwise tick in the same second, both read
- * the same stale stamp, and both sync. The stamp is the real defence; this makes the window that
- * defeats it vanishingly narrow, by spreading starts across the hour rather than aligning them.
+ * ⚠ THIS WAS UP TO A FULL HOUR, AND ON RENDER'S FREE TIER THAT MEANT NEVER. Their banner says it
+ * plainly: "Your free instance will spin down with inactivity". The service sleeps after roughly
+ * fifteen minutes idle, and the log read:
+ *
+ *     [myob] actuals schedule ON — first check in 37 min, then hourly
+ *
+ * A first check 37 minutes out on a service that sleeps at 15 never happens. Every wake re-armed
+ * the same doomed timer, so the schedule was on and could not fire — the worst combination, because
+ * the startup line says ON and the health panel says Working right up until the figures go stale.
+ *
+ * The hour of jitter existed to stop two instances ticking in the same second. Render reports
+ * WEB_CONCURRENCY=1, so there was no second instance to collide with — and the real defence was
+ * never the jitter anyway: it is max(synced_at) in the data, which a second instance reads and
+ * obeys. A minute is plenty to break a tie and short enough to land inside any waking window.
  *
  * `rand` is injectable so the spread is tested rather than hoped for. */
+export const FIRST_CHECK_MS = 60 * 1000;
 export function startupJitterMs(rand = Math.random) {
-  return Math.floor(rand() * CHECK_MS);
+  return Math.floor(rand() * FIRST_CHECK_MS);
 }
 
 /* Is the scheduler switched on? OFF unless asked for, so deploying this cannot start making

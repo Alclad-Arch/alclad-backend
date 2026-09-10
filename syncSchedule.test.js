@@ -17,7 +17,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   shouldRunNow, startupJitterMs, schedulerEnabled, inWindow, windowStart,
-  MIN_HOURS, CHECK_MS, MAX_HOURS, WINDOW_UTC,
+  MIN_HOURS, CHECK_MS, MAX_HOURS, WINDOW_UTC, FIRST_CHECK_MS,
 } from "./syncSchedule.js";
 
 const at = (utcHour, day = 11) =>
@@ -187,12 +187,22 @@ test("simulated over a fortnight it syncs ONCE A DAY, always in the window", () 
 });
 
 // ── jitter and the switch ─────────────────────────────────────────────────
-test("jitter spreads the first check across the hour", () => {
+test("the first check happens within a MINUTE, not an hour", () => {
+  /* ⚠ THE ONE THAT MADE THE SCHEDULE UNABLE TO FIRE. Render's free tier spins the service down after
+     about fifteen minutes idle, and with up to an hour of jitter the log read "first check in 37
+     min" — a check that never arrives, re-armed identically on every wake. On is not the same as
+     running, and the startup line said ON. */
+  assert.equal(FIRST_CHECK_MS, 60 * 1000);
+  assert.ok(FIRST_CHECK_MS < 15 * 60 * 1000, 'must land before a free instance sleeps');
   assert.equal(startupJitterMs(() => 0), 0);
-  assert.equal(startupJitterMs(() => 0.5), CHECK_MS / 2);
-  /* Strictly inside — a jitter that can equal the interval delays the first check by a whole extra
-     hour. */
-  assert.ok(startupJitterMs(() => 0.999999) < CHECK_MS);
+  assert.equal(startupJitterMs(() => 0.5), FIRST_CHECK_MS / 2);
+  /* Strictly inside, so it cannot equal the bound and slip past. */
+  assert.ok(startupJitterMs(() => 0.999999) < FIRST_CHECK_MS);
+});
+
+test("the hourly interval is still an hour — only the FIRST check moved", () => {
+  /* Shortening the interval too would hammer the database on a service that never sleeps. */
+  assert.equal(CHECK_MS, 60 * 60 * 1000);
 });
 
 test("the scheduler is OFF unless explicitly enabled", () => {

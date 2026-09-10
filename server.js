@@ -797,7 +797,7 @@ function startActualsSchedule() {
     }
   };
   const jitter = startupJitterMs();
-  console.log(`[myob] actuals schedule ON — first check in ${Math.round(jitter / 60000)} min, then hourly`);
+  console.log(`[myob] actuals schedule ON — first check in ${Math.round(jitter / 1000)}s, then hourly`);
   /* unref so this timer can never hold the process open during a shutdown. */
   setTimeout(() => { tick(); setInterval(tick, CHECK_MS).unref(); }, jitter).unref();
 }
