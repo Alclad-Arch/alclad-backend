@@ -50,6 +50,15 @@ const tenant = tenants[0] || "";
      $env:MYOB_GI = "ALX_JobTrans,VelixoReportsPro-PMHistoryByDateMaster,ALX_Projects" */
 const gis = (process.env.MYOB_GI || "").split(",").map((g) => g.trim()).filter(Boolean);
 const gi = gis[0] || "";
+/* How many rows to ask for. One is enough to learn the columns, which is the usual question;
+   a few more is how you learn what the IDENTIFIERS look like — whether MYOB's ProjectID is the
+   job number the hub uses. */
+const top = Math.max(1, Math.min(50, Number(process.env.MYOB_TOP || 1) || 1));
+/* Rows are NOT printed unless asked for. The columns answer "can this inquiry feed the hub";
+   the values are ledger figures, and putting those in a terminal by default serves nothing.
+   MYOB_SHOW=1 prints them, for the one job it is genuinely needed for: working out how MYOB's
+   ProjectID lines up with the hub's job numbers. */
+const show = process.env.MYOB_SHOW === "1";
 const user = process.env.MYOB_ODATA_USER || "";
 const pass = process.env.MYOB_ODATA_PASS || "";
 
@@ -57,6 +66,7 @@ console.log(`\nMYOB OData probe — the surface an Excel add-in reads\n${instanc
 console.log(`tenant: ${tenants.length ? tenants.join(" | ") : "(unset — tenant-scoped addresses skipped, not guessed)"}`);
 console.log(`inquiry: ${gis.length ? gis.join(" | ") : "(unset — the service document still lists what is exposed)"}`);
 console.log(`credentials: ${user && pass ? `Basic as ${user}` : "NONE — set MYOB_ODATA_USER / MYOB_ODATA_PASS"}`);
+console.log(`rows: $top=${top}${show ? " · MYOB_SHOW=1, values will be printed" : " · columns only (MYOB_SHOW=1 to print values)"}`);
 
 /* Anonymous first, deliberately. If the service document answers without credentials that is
    worth knowing on its own — and it separates "this address exists" from "these credentials
@@ -84,6 +94,7 @@ const seen = new Set();
 const rows = [];
 const exposed = [];   // [label, [inquiry names]] for every catalogue that answered
 const columns = [];   // [label, [field names]] for every inquiry that returned a row
+const samples = [];   // [label, rows] only when MYOB_SHOW=1
 for (const [mode, header] of modes) {
   for (const t of passes) {
   for (const g of (gis.length ? gis : [""])) {
@@ -97,7 +108,8 @@ for (const [mode, header] of modes) {
        "GI (classic)" four times over says nothing about which answered. */
     if (g && c.label.startsWith('GI')) label = `GI ${g.slice(0, 26)}`;
     try {
-      const res = await fetch(c.url, {
+      const url = c.url.replace("$top=1", `$top=${top}`);
+      const res = await fetch(url, {
         headers: { Accept: "application/json", ...(header ? { Authorization: header } : {}) },
       });
       const { verdict, note } = readOdataStatus(res.status);
@@ -129,6 +141,12 @@ for (const [mode, header] of modes) {
           } else if (first && typeof first === 'object') {
             columns.push([label, Object.keys(first)]);
             detail = `${(j.value || []).length} row(s), ${Object.keys(first).length} column(s)`;
+            if (show) samples.push([label, j.value]);
+          } else {
+            /* 200 with NO rows is its own finding, not a blank: an inquiry that needs
+               parameters answers exactly like this, and reading it as "empty" would write the
+               feed off for the wrong reason. */
+            detail = "200 but ZERO rows — the inquiry may need parameters";
           }
         } catch { /* not JSON — the raw sample above already says so */ }
       }
@@ -138,6 +156,22 @@ for (const [mode, header] of modes) {
     }
   }
   }
+  }
+}
+
+/* A 403 NEXT TO 200s MEANS SOMETHING ELSE. readOdataStatus reads one status at a time, so it
+   calls every 403 "the same wall as the REST entities" — which is right when everything is
+   refused and wrong when a single inquiry is. Acumatica restricts Generic Inquiries per role, so
+   one refusal among successes is an access right ON THAT INQUIRY, and telling the two apart is
+   the difference between "ask for that GI to be shared" and "buy an entitlement". */
+{
+  const anyOpen = rows.some((r) => /OPEN/.test(r[2]));
+  if (anyOpen) {
+    for (const r of rows) {
+      if (/REFUSED/.test(r[2])) {
+        r[3] = "refused while OTHER inquiries answered — an access right on this inquiry, not the tenant";
+      }
+    }
   }
 }
 
@@ -171,6 +205,11 @@ for (const [label, cols] of columns) {
   console.log('  ' + cols.join(', '));
 }
 
+for (const [label, rowsOut] of samples) {
+  console.log(`\nROWS of ${label} — ${rowsOut.length}:`);
+  for (const r of rowsOut) console.log('  ' + JSON.stringify(r));
+}
+
 console.log("");
 if (open.length) {
   console.log("FINDING: OData ANSWERS as this user. That is almost certainly how Velixo reads the");
@@ -179,6 +218,11 @@ if (open.length) {
   console.log("Next: expose exactly the figures the hub needs as a Generic Inquiry and read that one");
   console.log("address, rather than reaching for whole entities. And confirm with MYOB/Velixo that a");
   console.log("second client on this channel is within licence — that part is commercial, not technical.");
+  if (rows.some((r) => /REFUSED/.test(r[2]))) {
+    console.log("");
+    console.log("One inquiry was refused while others answered — that is a per-inquiry access right,");
+    console.log("granted on the Generic Inquiry itself, and it does not affect the rest.");
+  }
 } else if (auth.length) {
   console.log("FINDING: the surface EXISTS and did not accept these credentials. Worth checking the");
   console.log("username is the exact one in Velixo's connection (often a dedicated integration user),");
