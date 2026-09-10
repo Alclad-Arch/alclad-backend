@@ -79,7 +79,12 @@ export function cookieHeader(setCookieValues = []) {
  */
 export async function readInquiry({
   instance, tenant, inquiry, user, pass,
-  select = [], filter = '', orderBy = '', pageSize = 500, maxRows = 100000,
+  /* maxRows GUARDS AGAINST A BAD FILTER, not against a big inquiry. ALX_JobTrans returned 52,970
+     rows on 2026-09-10 — over half the old 100,000 cap — and it grows with every transaction ever
+     posted, so that cap was a year or two from being hit. Hitting it is now safe rather than
+     destructive (the read reports incomplete and the sweep refuses), but the failure is a silently
+     stale hub, so give it real headroom and revisit with a period filter long before this. */
+  select = [], filter = '', orderBy = '', pageSize = 500, maxRows = 1000000,
   fetchImpl = fetch,
 } = {}) {
   if (!instance || !tenant || !inquiry) throw new Error('readInquiry needs instance, tenant and inquiry');
