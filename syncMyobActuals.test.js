@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { syncActuals, chunk, shouldSweep, toTableRows, TABLE } from "./syncMyobActuals.js";
 import { GROUPS_INQUIRY } from "./myobOdataRead.js";
+import { BUDGET_INQUIRY } from "./myobJobAnalysis.js";
 
 const CREDS = {
   instance: "https://alcladarchitectural.myobadvanced.com",
@@ -46,13 +47,22 @@ const GROUPS = [
   { AccountGroupCD: "CLADDING  ", Type: "Income" },
 ];
 
-/* A SYNC MAKES TWO READS: the classification, then the ledger. A fake that answers both with the
-   same rows is how the first version of these tests passed while classifying nothing. */
-const oneRead = (rows, complete = true, groups = GROUPS) => async (args) => (
-  args.inquiry === GROUPS_INQUIRY
-    ? { rows: groups, requests: 1, complete: true, cookie: "ASP.NET_SessionId=abc" }
-    : { rows, requests: 1, complete, cookie: args.cookie || "", sessionReused: !!args.cookie }
-);
+/* A SYNC MAKES THREE READS: the classification, the ledger, then the contract/budget inquiry. A
+   fake that answers them all with the same rows is how the first version of these tests passed
+   while classifying nothing — so this dispatches on the inquiry and every read has to be asked for
+   by name.
+
+   `budget` defaults to EMPTY: most of these tests are about the ledger half, and an empty budget
+   read writes no rows and sweeps nothing, so it cannot quietly affect their assertions. */
+const oneRead = (rows, complete = true, groups = GROUPS, budget = []) => async (args) => {
+  if (args.inquiry === GROUPS_INQUIRY) {
+    return { rows: groups, requests: 1, complete: true, cookie: "ASP.NET_SessionId=abc" };
+  }
+  if (args.inquiry === BUDGET_INQUIRY) {
+    return { rows: budget, requests: 1, complete: true, cookie: args.cookie || "" };
+  }
+  return { rows, requests: 1, complete, cookie: args.cookie || "", sessionReused: !!args.cookie };
+};
 
 // ── chunking ──────────────────────────────────────────────────────────────
 test("chunking keeps every row, including the last partial one", () => {
@@ -164,6 +174,9 @@ test("the read is asked for the actuals inquiry, with only the columns stored", 
     creds: CREDS,
     read: async (args) => {
       if (args.inquiry === GROUPS_INQUIRY) return { rows: GROUPS, requests: 1, complete: true, cookie: "c" };
+      if (args.inquiry === BUDGET_INQUIRY) return { rows: [], requests: 1, complete: true };
+      /* Captured ONLY for the ledger read — a third inquiry was added later and overwrote this,
+         so the assertions below silently described the wrong call. */
       asked = args;
       return { rows: [], requests: 1, complete: true };
     },
@@ -199,9 +212,12 @@ test("a reader that does not report completeness leaves rows alone", async () =>
   const out = await syncActuals(db, {
     creds: CREDS,
     /* The classification read is normal; it is the LEDGER read that omits `complete`. */
-    read: async (args) => (args.inquiry === GROUPS_INQUIRY
-      ? { rows: GROUPS, requests: 1, complete: true, cookie: "c" }
-      : { rows: [{ Project: "6931", AccountGroup: "STAFF", Amount: 5 }], requests: 1 }),
+    read: async (args) => {
+      if (args.inquiry === GROUPS_INQUIRY) return { rows: GROUPS, requests: 1, complete: true, cookie: "c" };
+      if (args.inquiry === BUDGET_INQUIRY) return { rows: [], requests: 1, complete: true };
+      /* The LEDGER read omits "complete" — that is what this test is about. */
+      return { rows: [{ Project: "6931", AccountGroup: "STAFF", Amount: 5 }], requests: 1 };
+    },
   });
   assert.equal(out.swept, 0);
   assert.equal(db.state.deletes.length, 0);
@@ -272,8 +288,9 @@ test("a BLANK account group refuses too, rather than vanishing", async () => {
     /\(blank\)/);
 });
 
-test("both reads share ONE session", async () => {
-  /* Sessions, not requests, are what the Acumatica licence counts. */
+test("all THREE reads share ONE session", async () => {
+  /* Sessions, not requests, are what the Acumatica licence counts — so adding a third inquiry must
+     not add a third session. */
   const seen = [];
   await syncActuals(fakeDb(), {
     creds: CREDS,
@@ -283,9 +300,11 @@ test("both reads share ONE session", async () => {
       return { rows: [], requests: 1, complete: true, cookie: args.cookie };
     },
   });
-  assert.equal(seen.length, 2);
+  assert.equal(seen.length, 3, seen.map((x) => x.inquiry).join(", "));
   assert.equal(seen[0].inquiry, GROUPS_INQUIRY, "classification first — without it nothing is safe to store");
-  assert.equal(seen[1].cookie, "SESS=1", "the ledger read reuses the session the first one opened");
+  for (const r of seen.slice(1)) {
+    assert.equal(r.cookie, "SESS=1", `${r.inquiry} opened its own session instead of reusing`);
+  }
 });
 
 // ── the daily guard ───────────────────────────────────────────────────────
@@ -358,4 +377,105 @@ test("a skip is shaped like a result, not an exception", async () => {
     assert.equal(out[k], 0, `${k} should be 0 on a skip`);
   }
   assert.equal(out.swept, 0, 'and above all it must not sweep');
+});
+
+// ── the contract and budget half ──────────────────────────────────────────
+/* Job 3817's real ALX_JobAnalysis rows, abbreviated to the fields the roll-up reads. Revenue and
+   cost sit on DIFFERENT rows and the side depends on AccountGroupID — see myobJobAnalysis.js. */
+const BUDGET_ROWS = [
+  { Project: '3817      ', ProjectName: '181 William St', Type: 'R', Stage: 'Completed',
+    AccountGroupID: 'GLAZING', BudgetRevenue: 4011186.35, ContractVariations: 511540.31,
+    ContractValueIncVar: 4522726.66, InvoicedAmt: 3890777.47 },
+  { Project: '3817      ', ProjectName: '181 William St', Type: 'R', Stage: 'Completed',
+    /* STAFF rather than 3817's real SUBCONT: this file's GROUPS fixture classifies MATERIAL and
+       STAFF only, and the point here is the two-SIDED grain, not which expense group it is. */
+    AccountGroupID: 'STAFF', BudgetCost: 2786153.48, CostsToDate: 3745175.19,
+    ContractVariations: -355478.48, ContractValueIncVar: -3141631.96 },
+];
+
+test("the budget inquiry is read, and written to its own table", async () => {
+  const db = fakeDb();
+  const out = await syncActuals(db, {
+    creds: CREDS,
+    read: oneRead([{ Project: "3817", AccountGroup: "STAFF", Amount: 1 }], true, GROUPS, BUDGET_ROWS),
+  });
+  assert.equal(out.budgetRead, 2, "both inquiry rows were read");
+  assert.equal(out.budgetWritten, 1, "and rolled to one project x type");
+  const b = db.state.upserts.find((u) => u.rows[0] && 'contract_value' in u.rows[0]);
+  assert.ok(b, "a budget upsert happened");
+  assert.equal(b.opts.onConflict, "project_id,package_type", "the budget grain, not the ledger's");
+  /* THE FIGURE THAT MUST NOT BE SUMMED ACROSS SIDES. 4,522,726.66 is right;
+     1,381,094.70 is what summing all rows would give, and it looks plausible. */
+  assert.equal(b.rows[0].contract_value, 4522726.66);
+  assert.equal(b.rows[0].budget_cost, 2786153.48);
+  assert.equal(b.rows[0].project_id, "3817", "trimmed");
+  assert.equal(b.rows[0].package_scope, "Recladding", "Type R mapped to the hub's vocabulary");
+});
+
+test("the report separates the two halves", async () => {
+  /* One number for both would hide a feed that read nothing while the other worked. */
+  const out = await syncActuals(fakeDb(), {
+    creds: CREDS,
+    read: oneRead([{ Project: "3817", AccountGroup: "STAFF", Amount: 1 }], true, GROUPS, BUDGET_ROWS),
+  });
+  assert.equal(out.written, 1, "the ledger half");
+  assert.equal(out.budgetWritten, 1, "the budget half");
+  assert.equal(out.withContractValue, 1);
+  assert.equal(out.withCostBudget, 1);
+  assert.equal(out.budgetComplete, true);
+});
+
+test("a job with NO cost budget is counted as such", async () => {
+  /* Jed: not all jobs have one yet. MYOB writes it as 0.00, and the count is what says how many
+     are genuinely missing rather than genuinely zero. */
+  const out = await syncActuals(fakeDb(), {
+    creds: CREDS,
+    read: oneRead([], true, GROUPS, [BUDGET_ROWS[0]]),
+  });
+  assert.equal(out.withContractValue, 1);
+  assert.equal(out.withCostBudget, 0);
+});
+
+test("an unclassified group in the BUDGET inquiry refuses the whole sync", async () => {
+  /* Either new revenue, which inflates a contract value, or new cost, which is missing from a
+     budget. Thrown before any write, so the pair cannot be half-updated. */
+  const db = fakeDb();
+  await assert.rejects(
+    () => syncActuals(db, {
+      creds: CREDS,
+      read: oneRead([], true, GROUPS, [{ ...BUDGET_ROWS[0], AccountGroupID: 'FREIGHT' }]),
+    }),
+    /FREIGHT/);
+  assert.equal(db.state.upserts.length, 0, "nothing was written at all");
+  assert.equal(db.state.deletes.length, 0);
+});
+
+test("the budget sweep is judged on the BUDGET read, not the ledger's", async () => {
+  /* Gating one on the other would delete a project's contract because its transactions failed to
+     read, and vice versa — two feeds, two independent decisions. */
+  const db = fakeDb({ deleted: [{ project_id: "gone" }] });
+  const out = await syncActuals(db, {
+    creds: CREDS,
+    now: () => "2026-09-10T00:00:00.000Z",
+    read: async (args) => {
+      if (args.inquiry === GROUPS_INQUIRY) return { rows: GROUPS, requests: 1, complete: true, cookie: "c" };
+      if (args.inquiry === BUDGET_INQUIRY) return { rows: BUDGET_ROWS, requests: 1, complete: true };
+      /* The LEDGER read is truncated — its sweep must not run, while the budget's still can. */
+      return { rows: [{ Project: "3817", AccountGroup: "STAFF", Amount: 1 }], requests: 1, complete: false };
+    },
+  });
+  assert.equal(out.swept, 0, "the ledger sweep correctly refused");
+  assert.equal(out.budgetSwept, 1, "the budget sweep was not held back by it");
+});
+
+test("an empty budget read writes nothing and sweeps nothing", async () => {
+  /* The same rule as the ledger: zero rows is indistinguishable from a renamed inquiry or a
+     withdrawn permission, and sweeping on it would delete every contract value in the hub. */
+  const db = fakeDb({ deleted: [{ project_id: "everything" }] });
+  const out = await syncActuals(db, {
+    creds: CREDS,
+    read: oneRead([{ Project: "1", AccountGroup: "STAFF", Amount: 1 }], true, GROUPS, []),
+  });
+  assert.equal(out.budgetWritten, 0);
+  assert.equal(out.budgetSwept, 0);
 });

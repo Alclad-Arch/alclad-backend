@@ -19,9 +19,15 @@ import {
   ACTUALS_INQUIRY, ACTUALS_SELECT, ACTUALS_ORDER, GROUPS_INQUIRY, GROUPS_SELECT,
 } from "./myobOdataRead.js";
 import { readOdataCreds } from "./myobOdataCreds.js";
+import {
+  rollUpJobAnalysis, BUDGET_INQUIRY, BUDGET_SELECT, BUDGET_ORDER, BUDGET_NUMERIC,
+} from "./myobJobAnalysis.js";
 import { shouldRunNow } from "./syncSchedule.js";
 
 export const TABLE = "myob_actuals";
+/* The contract-and-budget half, from ALX_JobAnalysis. Written in the SAME run as the ledger so both
+   reads share one Acumatica session — sessions, not requests, are what the licence counts. */
+export const BUDGET_TABLE = "myob_project_budget";
 export const CHUNK = 500;
 
 /* When did the last successful sync finish? max(synced_at) — every run stamps every row it writes,
@@ -146,6 +152,40 @@ export async function syncActuals(db, {
   const rolled = rollUpActuals(rows, { costGroups, incomeGroups: income });
   const tableRows = toTableRows(rolled, syncedAt);
 
+  /* ── THE CONTRACT AND BUDGET READ ─────────────────────────────────────────────────────────────
+   *
+   * Third read, same session. ALX_JobAnalysis is small — one row per project × cost bucket, not per
+   * transaction — so this costs one request, not a hundred.
+   *
+   * Its grain is the subtle part: revenue and cost figures sit on DIFFERENT rows and which side a
+   * row belongs to depends on its AccountGroupID, so the same tenant classification used above is
+   * passed straight in. ContractValueIncVar is NOT summable across both sides — see
+   * myobJobAnalysis.js. */
+  const budgetRead = await read({
+    instance: creds.instance, tenant: creds.tenant, inquiry: BUDGET_INQUIRY,
+    user: creds.user, pass: creds.pass, select: BUDGET_SELECT, orderBy: BUDGET_ORDER,
+    cookie: groupRead.cookie,
+  });
+  const { rows: budgetRolled, unknownGroups: budgetStrays } =
+    rollUpJobAnalysis(budgetRead.rows, { costGroups, incomeGroups: income });
+  /* REFUSE, as the ledger read does. An unclassified group is either new revenue, which would
+     inflate a contract value, or new cost, which would be missing from a budget, and nothing here
+     can tell which. Thrown before ANY write, so a bad classification cannot half-update the pair. */
+  if (budgetStrays.length) {
+    throw new Error(`${BUDGET_INQUIRY} carries account group(s) not in ${GROUPS_INQUIRY}: ${budgetStrays.join(", ")} — refusing to sync`);
+  }
+  const budgetTableRows = budgetRolled.map((r) => ({
+    project_id: r.project_id,
+    package_type: r.package_type,
+    package_scope: r.package_scope,
+    project_name: r.project_name,
+    project_manager: r.project_manager,
+    stage: r.stage,
+    ...Object.fromEntries(BUDGET_NUMERIC.map((f) => [f, r[f]])),
+    source_rows: r.source_rows,
+    synced_at: syncedAt,
+  }));
+
   let written = 0;
   for (const part of chunk(tableRows)) {
     const { error } = await db.from(TABLE).upsert(part, { onConflict: "project_id,cost_code,fin_period" });
@@ -157,6 +197,29 @@ export async function syncActuals(db, {
       throw e;
     }
     written += part.length;
+  }
+
+  /* The budget table, on its own grain. Written after the ledger so a failure here leaves the
+     actuals intact and correct rather than the pair half-updated in an unknown combination. */
+  let budgetWritten = 0;
+  for (const part of chunk(budgetTableRows)) {
+    const { error } = await db.from(BUDGET_TABLE).upsert(part, { onConflict: "project_id,package_type" });
+    if (error) {
+      const e = new Error(`${BUDGET_TABLE} upsert failed after ${budgetWritten} row(s): ${error.message}`);
+      e.written = budgetWritten;
+      throw e;
+    }
+    budgetWritten += part.length;
+  }
+
+  let budgetSwept = 0;
+  /* Judged on its OWN read and its OWN write count. Gating the budget sweep on the ledger's success
+     would delete a project's contract because its transactions failed to read, and vice versa —
+     two feeds, two independent decisions. */
+  if (shouldSweep({ complete: budgetRead.complete === true, rowsWritten: budgetWritten })) {
+    const { data, error } = await db.from(BUDGET_TABLE).delete().lt("synced_at", syncedAt).select("project_id");
+    if (error) throw new Error(`${BUDGET_TABLE} sweep failed: ${error.message}`);
+    budgetSwept = Array.isArray(data) ? data.length : 0;
   }
 
   let swept = 0;
@@ -176,13 +239,21 @@ export async function syncActuals(db, {
     rolled: rolled.length,
     written,
     swept,
-    requests: requests + groupRead.requests,
+    requests: requests + groupRead.requests + budgetRead.requests,
     sessionReused,
     complete: complete === true,
     /* Said out loud in the report, because "which groups counted as cost" is the question behind
        every figure here and the answer now comes from the tenant rather than this file. */
     costGroups: [...costGroups].sort(),
     incomeGroups: [...income].sort(),
+    /* The budget half, reported separately — one number for both would hide a feed that read
+       nothing while the other worked. */
+    budgetRead: budgetRead.rows.length,
+    budgetWritten,
+    budgetSwept,
+    budgetComplete: budgetRead.complete === true,
+    withContractValue: budgetRolled.filter((r) => r.contract_value !== 0).length,
+    withCostBudget: budgetRolled.filter((r) => r.budget_cost !== 0).length,
     syncedAt,
     as: creds.user,
     /* Named so a summary can say it out loud: the whole point of the roll-up is that these two

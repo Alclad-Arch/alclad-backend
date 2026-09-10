@@ -121,6 +121,15 @@ try {
     console.log(`rolled  ${out.rolled} figure(s) from ${out.ledgerRows} ledger line(s)`);
     console.log(`written ${out.written}`);
     console.log(`swept   ${out.swept} row(s) MYOB no longer reports`);
+    /* The budget half, reported separately: one line for both would hide a feed that read nothing
+       while the other worked. withCostBudget is the number worth watching as Jed populates them. */
+    console.log(``);
+    console.log(`contract/budget from ALX_JobAnalysis`);
+    console.log(`read    ${out.budgetRead} row(s)${out.budgetComplete ? "" : " — INCOMPLETE"}`);
+    console.log(`written ${out.budgetWritten} project x package figure(s)`);
+    console.log(`swept   ${out.budgetSwept}`);
+    console.log(`  with a contract value : ${out.withContractValue}`);
+    console.log(`  with a cost budget    : ${out.withCostBudget}`);
     console.log(`stamped ${out.syncedAt}\n`);
   }
 } catch (e) {
