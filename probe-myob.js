@@ -168,3 +168,99 @@ if (ok < results.length && controlsOk > 0) {
 // the half of this that has no other visible symptom until it fails.
 const { data } = await db.from("integration_tokens").select("rotated_count, updated_at").eq("provider", "myob").maybeSingle();
 if (data) console.log(`refresh token rotated ${data.rotated_count} time(s), last written ${data.updated_at}\n`);
+
+/* ── THE OTHER DOOR: OData ────────────────────────────────────────────────────────────────────
+ *
+ * Everything above probes /entity/Default/<version>/… — the contract-based REST API. Acumatica
+ * family systems expose OData over Generic Inquiries as a SEPARATE surface, with its own
+ * entitlement and its own auth.
+ *
+ * Why it is worth asking: Velixo already extracts live data from this tenant into Excel (Jed,
+ * 2026-09-10), so some channel is authorised today, and an Excel reporting add-in is exactly the
+ * kind of client that reads OData/GI. If this answers, the app may be able to use the same door
+ * and the API entitlement need not be bought.
+ *
+ * This is not a retry of what was eliminated — roles, grants, tenant and scope were ruled out for
+ * the REST surface. A 403 here is the same wall on a second door; a 200 is the door Velixo uses.
+ *
+ * Optional environment, all skipped rather than guessed when unset:
+ *   MYOB_TENANT       the company/tenant segment, for the tenant-scoped URL shapes
+ *   MYOB_GI           a Generic Inquiry name to pull one row from
+ *   MYOB_ODATA_USER   ) Basic credentials — the shape an Excel add-in signs in with, and the
+ *   MYOB_ODATA_PASS   ) likeliest reason a bearer 401s here while Velixo works. Never printed.
+ */
+{
+  const { odataCandidates, readOdataStatus, authHeader } = await import("./myobOdata.js");
+  const tenant = process.env.MYOB_TENANT || "";
+  const gi = process.env.MYOB_GI || "";
+  const user = process.env.MYOB_ODATA_USER || "";
+  const pass = process.env.MYOB_ODATA_PASS || "";
+
+  console.log(`\n── OData (the surface Velixo would use) ──`);
+  if (!tenant) console.log("MYOB_TENANT unset — the tenant-scoped addresses are skipped, not guessed.");
+  if (!gi) console.log("MYOB_GI unset — no named inquiry is probed; the service document still says what is exposed.");
+  console.log(`credentials: bearer (the service token)${user && pass ? " and Basic (MYOB_ODATA_USER)" : " only — set MYOB_ODATA_USER / MYOB_ODATA_PASS to also try Basic"}`);
+
+  let token = null;
+  try {
+    const { getMyobAccessToken } = await import("./myobToken.js");
+    token = await getMyobAccessToken(db);
+  } catch (e) {
+    console.log(`(no bearer available — ${(e && e.message) || e})`);
+  }
+
+  const modes = [["bearer", { token }]];
+  if (user && pass) modes.push(["basic", { user, pass }]);
+
+  const rows = [];
+  for (const [mode, creds] of modes) {
+    const header = authHeader(mode, creds);
+    if (!header) continue;
+    for (const c of odataCandidates(cfg.instance, tenant, gi)) {
+      try {
+        const res = await fetch(c.url, { headers: { Authorization: header, Accept: "application/json" } });
+        const { verdict, note } = readOdataStatus(res.status);
+        /* A body sample only on success: it is the difference between "the endpoint answered"
+           and "the endpoint answered with our data", and one is worth acting on. */
+        let sample = note;
+        if (res.status === 200) {
+          const text = await res.text().catch(() => "");
+          sample = `${text.replace(/\s+/g, " ").slice(0, 100)}…`;
+        }
+        rows.push([mode, c.label, `${res.status} ${verdict}`, sample]);
+      } catch (e) {
+        rows.push([mode, c.label, "UNREACHABLE", String((e && e.message) || e).slice(0, 90)]);
+      }
+    }
+  }
+
+  const w = (s, n) => String(s).padEnd(n);
+  console.log("\n" + w("AUTH", 8) + w("ADDRESS", 22) + w("RESULT", 18) + "WHAT IT MEANS");
+  console.log("-".repeat(110));
+  for (const r of rows) console.log(w(r[0], 8) + w(r[1], 22) + w(r[2], 18) + r[3]);
+
+  const open = rows.filter((r) => /OPEN/.test(r[2]));
+  const auth = rows.filter((r) => /AUTH/.test(r[2]));
+  const refused = rows.filter((r) => /REFUSED/.test(r[2]));
+  console.log("");
+  if (open.length) {
+    console.log("FINDING: OData ANSWERS. This is very likely the channel Velixo uses, and the app can");
+    console.log("read it the same way — actuals could come through without buying the REST entitlement.");
+    console.log("Next: confirm with MYOB/Velixo that a second client on this channel is within licence,");
+    console.log("then expose the figures the hub needs as a Generic Inquiry and read that.");
+  } else if (auth.length && !refused.length) {
+    console.log("FINDING: the OData surface EXISTS and rejected these credentials rather than refusing");
+    console.log("the request. That is the encouraging answer — it is a credentials question, not an");
+    console.log("entitlement one. Find out which user Velixo signs in as and try Basic with it");
+    console.log("(MYOB_ODATA_USER / MYOB_ODATA_PASS), rather than the service token.");
+  } else if (refused.length) {
+    console.log("FINDING: authenticated and refused on OData too — the same wall as the REST entities,");
+    console.log("on a second door. That points at a tenant-level entitlement rather than anything we");
+    console.log("can configure. Worth asking MYOB directly how Velixo is authorised, since it plainly");
+    console.log("is: whatever answer they give names the channel we should be using.");
+  } else {
+    console.log("FINDING: nothing answered. Before concluding anything, get the real OData address from");
+    console.log("Velixo's connection settings — every shape here is a guess at how the tenant is");
+    console.log("provisioned, and a 404 is not a rights answer.");
+  }
+}
