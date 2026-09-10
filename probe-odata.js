@@ -50,7 +50,16 @@ console.log(`credentials: ${user && pass ? `Basic as ${user}` : "NONE — set MY
    worth knowing on its own — and it separates "this address exists" from "these credentials
    work", which is the distinction the whole exercise turns on. */
 const modes = [["none", null]];
-if (user && pass) modes.push(["basic", authHeader("basic", { user, pass })]);
+if (user && pass) {
+  modes.push(["basic", authHeader("basic", { user, pass })]);
+  /* Acumatica-family tenants commonly want the company folded into the username as
+     `user@tenant` — a bare username then 401s exactly like a wrong password, which is a whole
+     round trip wasted on a formatting convention. Tried automatically when a tenant is known and
+     the username does not already carry one. */
+  if (tenant && !user.includes("@")) {
+    modes.push([`basic@t`, authHeader("basic", { user: `${user}@${tenant}`, pass })]);
+  }
+}
 
 const rows = [];
 for (const [mode, header] of modes) {
@@ -61,6 +70,12 @@ for (const [mode, header] of modes) {
       });
       const { verdict, note } = readOdataStatus(res.status);
       let detail = note;
+      /* WHAT THE SERVER SAYS IT WANTS. A 401 carries WWW-Authenticate naming the scheme and
+         often the realm, which answers "Basic or Bearer?" instead of us inferring it. */
+      if (res.status === 401) {
+        const ch = res.headers.get("www-authenticate");
+        if (ch) detail = `wants: ${ch.slice(0, 70)} · ${note}`;
+      }
       if (res.status === 200) {
         const text = await res.text().catch(() => "");
         detail = text.replace(/\s+/g, " ").slice(0, 110) + "…";
@@ -77,7 +92,7 @@ console.log("\n" + w("AUTH", 7) + w("ADDRESS", 22) + w("RESULT", 18) + "WHAT IT 
 console.log("-".repeat(112));
 for (const r of rows) console.log(w(r[0], 7) + w(r[1], 22) + w(r[2], 18) + r[3]);
 
-const basic = rows.filter((r) => r[0] === "basic");
+const basic = rows.filter((r) => r[0].startsWith("basic"));
 const open = basic.filter((r) => /OPEN/.test(r[2]));
 const auth = basic.filter((r) => /AUTH/.test(r[2]));
 const refused = basic.filter((r) => /REFUSED/.test(r[2]));
