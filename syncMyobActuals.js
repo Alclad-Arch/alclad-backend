@@ -14,7 +14,7 @@
 //       every chunk having landed.
 //
 // The read itself is in myobOdataRead.js; the credential in myobOdataCreds.js.
-import { readInquiry, rollUpActuals, ACTUALS_INQUIRY, ACTUALS_SELECT } from "./myobOdataRead.js";
+import { readInquiry, rollUpActuals, ACTUALS_INQUIRY, ACTUALS_SELECT, ACTUALS_ORDER } from "./myobOdataRead.js";
 import { readOdataCreds } from "./myobOdataCreds.js";
 
 export const TABLE = "myob_actuals";
@@ -67,9 +67,9 @@ export async function syncActuals(db, {
   const creds = given || await readOdataCreds(db, env);
   const syncedAt = now();
 
-  const { rows, requests, sessionReused } = await read({
+  const { rows, requests, sessionReused, complete } = await read({
     instance: creds.instance, tenant: creds.tenant, inquiry: ACTUALS_INQUIRY,
-    user: creds.user, pass: creds.pass, select: ACTUALS_SELECT,
+    user: creds.user, pass: creds.pass, select: ACTUALS_SELECT, orderBy: ACTUALS_ORDER,
   });
 
   const rolled = rollUpActuals(rows);
@@ -89,7 +89,11 @@ export async function syncActuals(db, {
   }
 
   let swept = 0;
-  if (shouldSweep({ complete: true, rowsWritten: written })) {
+  /* COMPLETE COMES FROM THE READ, NOT FROM HOPE. This was `complete: true`, which made the guard
+     above unreachable: a read truncated at maxRows would have swept the projects it never reached.
+     Required to be exactly true, so a reader that does not report completeness leaves rows stale
+     for a day rather than deleting them. */
+  if (shouldSweep({ complete: complete === true, rowsWritten: written })) {
     const { data, error } = await db.from(TABLE).delete().lt("synced_at", syncedAt).select("project_id");
     if (error) throw new Error(`${TABLE} sweep failed: ${error.message}`);
     swept = Array.isArray(data) ? data.length : 0;
@@ -102,6 +106,7 @@ export async function syncActuals(db, {
     swept,
     requests,
     sessionReused,
+    complete: complete === true,
     syncedAt,
     as: creds.user,
     /* Named so a summary can say it out loud: the whole point of the roll-up is that these two

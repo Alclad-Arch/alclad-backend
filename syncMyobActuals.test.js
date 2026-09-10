@@ -37,7 +37,7 @@ const fakeDb = ({ upsertError = null, deleteError = null, deleted = [] } = {}) =
   };
 };
 
-const oneRead = (rows) => async () => ({ rows, requests: 1, sessionReused: false });
+const oneRead = (rows, complete = true) => async () => ({ rows, requests: 1, complete, sessionReused: false });
 
 // ── chunking ──────────────────────────────────────────────────────────────
 test("chunking keeps every row, including the last partial one", () => {
@@ -87,9 +87,9 @@ test("a normal run upserts the rolled-up rows and then sweeps", async () => {
     creds: CREDS,
     now: () => "2026-09-10T00:00:00.000Z",
     read: oneRead([
-      { ProjectID: "6667      ", CostCodeID: "100-02-01", FinPeriodID: "202608", ActualAmount: 100, ActualQty: 1 },
-      { ProjectID: "6667      ", CostCodeID: "100-02-01", FinPeriodID: "202608", ActualAmount: 50, ActualQty: 1 },
-      { ProjectID: "6931", CostCodeID: "100-03-01", FinPeriodID: "202608", ActualAmount: 25, ActualQty: 2 },
+      { Project: "6667      ", CostCode: "2000202", FinPeriod: "022027", Amount: 100, Qty: 1 },
+      { Project: "6667      ", CostCode: "2000202", FinPeriod: "022027", Amount: 50, Qty: 1 },
+      { Project: "6931", CostCode: "2000102", FinPeriod: "022027", Amount: 25, Qty: 2 },
     ]),
   });
   assert.equal(out.read, 3);
@@ -121,7 +121,7 @@ test("a failed upsert throws BEFORE the sweep, and says how far it got", async (
   /* A partial write plus a sweep is the one combination that loses data rather than delaying it. */
   const db = fakeDb({ upsertError: { message: "timeout" } });
   await assert.rejects(
-    () => syncActuals(db, { creds: CREDS, read: oneRead([{ ProjectID: "6667", ActualAmount: 1 }]) }),
+    () => syncActuals(db, { creds: CREDS, read: oneRead([{ Project: "6667", Amount: 1 }]) }),
     (e) => {
       assert.match(e.message, /upsert failed after 0 row\(s\)/);
       assert.equal(db.state.deletes.length, 0, "the sweep must not run after a failed write");
@@ -132,14 +132,14 @@ test("a failed upsert throws BEFORE the sweep, and says how far it got", async (
 test("a failed sweep is reported rather than swallowed", async () => {
   const db = fakeDb({ deleteError: { message: "nope" } });
   await assert.rejects(
-    () => syncActuals(db, { creds: CREDS, read: oneRead([{ ProjectID: "6667", ActualAmount: 1 }]) }),
+    () => syncActuals(db, { creds: CREDS, read: oneRead([{ Project: "6667", Amount: 1 }]) }),
     /sweep failed/);
 });
 
 test("the report names WHO it connected as", async () => {
   /* While this runs under a personal login, the report is the record of that — and the thing that
      makes the eventual switch to a dedicated user visible rather than assumed. */
-  const out = await syncActuals(fakeDb(), { creds: CREDS, read: oneRead([{ ProjectID: "1", ActualAmount: 1 }]) });
+  const out = await syncActuals(fakeDb(), { creds: CREDS, read: oneRead([{ Project: "1", Amount: 1 }]) });
   assert.equal(out.as, "nathan@alcladaus.com.au");
 });
 
@@ -149,8 +149,38 @@ test("the read is asked for the actuals inquiry, with only the columns stored", 
     creds: CREDS,
     read: async (args) => { asked = args; return { rows: [], requests: 1 }; },
   });
-  assert.match(asked.inquiry, /PMHistoryByDateMaster/);
+  /* ALX_JobTrans, not PMHistoryByDateMaster. The dry run proved PMHistory's ProjectID is an
+     internal integer that joins to no hub project, and that its rows mix income with cost. */
+  assert.equal(asked.inquiry, "ALX_JobTrans");
   assert.deepEqual(asked.select,
-    ["ProjectID", "CostCodeID", "AccountGroupID", "FinPeriodID", "ActualAmount", "ActualQty"]);
+    ["Project", "CostCode", "AccountGroup", "CostCodeGrp", "FinPeriod", "Amount", "Qty", "TranID"]);
+  assert.equal(asked.orderBy, "TranID", "paging $skip without an order can drop rows");
   assert.equal(asked.tenant, CREDS.tenant);
+});
+
+// ── the sweep guard has to be REACHABLE ───────────────────────────────────
+test("a TRUNCATED read writes its rows but must not sweep", async () => {
+  /* This is the bug the guard was written for and could not catch: syncActuals passed
+     `complete: true` literally, so a read that stopped at maxRows still swept — deleting exactly
+     the projects it never reached. Now completeness comes from the read. */
+  const db = fakeDb({ deleted: [{ project_id: "never-reached" }] });
+  const out = await syncActuals(db, {
+    creds: CREDS,
+    read: oneRead([{ Project: "6931", CostCode: "2000102", FinPeriod: "022027", Amount: 10 }], false),
+  });
+  assert.equal(out.written, 1, "what was read is still written");
+  assert.equal(out.swept, 0);
+  assert.equal(out.complete, false, "and the report says the read was short");
+  assert.equal(db.state.deletes.length, 0, "no delete was attempted");
+});
+
+test("a reader that does not report completeness leaves rows alone", async () => {
+  /* Stale for a day is recoverable; swept because a field was missing is not. */
+  const db = fakeDb({ deleted: [{ project_id: "x" }] });
+  const out = await syncActuals(db, {
+    creds: CREDS,
+    read: async () => ({ rows: [{ Project: "6931", Amount: 5 }], requests: 1 }),
+  });
+  assert.equal(out.swept, 0);
+  assert.equal(db.state.deletes.length, 0);
 });

@@ -13,7 +13,7 @@ import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
 import { syncActuals } from "./syncMyobActuals.js";
 import { readOdataCreds, describeCreds } from "./myobOdataCreds.js";
-import { readInquiry, rollUpActuals, ACTUALS_INQUIRY, ACTUALS_SELECT } from "./myobOdataRead.js";
+import { readInquiry, rollUpActuals, groupTotals, ACTUALS_INQUIRY, ACTUALS_SELECT, ACTUALS_ORDER } from "./myobOdataRead.js";
 
 const dry = process.argv.includes("--dry-run");
 
@@ -44,14 +44,30 @@ try {
   if (dry) {
     /* The read, the roll-up, and what WOULD be written — with no writes and no sweep, so this is
        safe to run against prod while deciding whether the figures look right. */
-    const { rows, requests, sessionReused } = await readInquiry({
+    const { rows, requests, sessionReused, complete } = await readInquiry({
       instance: creds.instance, tenant: creds.tenant, inquiry: ACTUALS_INQUIRY,
-      user: creds.user, pass: creds.pass, select: ACTUALS_SELECT,
+      user: creds.user, pass: creds.pass, select: ACTUALS_SELECT, orderBy: ACTUALS_ORDER,
     });
     const rolled = rollUpActuals(rows);
     const projects = new Set(rolled.map((r) => r.project_id));
     console.log(`\nread ${rows.length} ledger row(s) in ${requests} request(s)${sessionReused ? " (one session)" : ""}`);
     console.log(`rolls up to ${rolled.length} figure(s) across ${projects.size} project(s)`);
+    /* DID THE READ FINISH? Said out loud, because a truncated read is the one state where the
+       figures below look ordinary and the sync must not sweep. */
+    if (!complete) {
+      console.log("\n⚠ the read STOPPED EARLY (row cap reached, not the end of the inquiry).");
+      console.log("  A real run would write these rows and refuse to sweep. Raise maxRows first.");
+    }
+    /* WHICH GROUPS MAKE UP THE MONEY. The first attempt's 10.7M-per-project figures were income and
+       cost summed together, and one number per project could never have shown that. Named groups
+       (STAFF, MATERIAL, …) can be recognised or challenged before anything is written. */
+    const groups = groupTotals(rows);
+    console.log(`\nby account group — anything here that is INCOME rather than cost does not belong:`);
+    for (const g of groups) {
+      console.log(`  ${g.account_group.padEnd(14)} ${g.amount.toFixed(2).padStart(16)}  (${g.rows} row(s))`);
+    }
+    const all = groups.reduce((n, g) => n + g.amount, 0);
+    console.log(`  ${"TOTAL".padEnd(14)} ${all.toFixed(2).padStart(16)}`);
     /* A handful of projects by spend, so the figures can be eyeballed against MYOB before this is
        trusted. Deliberately a sample: the point is to sanity-check, not to reproduce the ledger. */
     const byProject = new Map();

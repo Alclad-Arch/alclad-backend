@@ -27,13 +27,18 @@
  * our intent legible in their logs, and means a column added to the inquiry cannot change what we
  * store. Everything is encoded — inquiry names contain spaces ("ALX_WIP Report") and the tenant
  * certainly does ("Alclad Architectural Live"). */
-export function giUrl(instance, tenant, inquiry, { select = [], filter = '', top = 0, skip = 0 } = {}) {
+export function giUrl(instance, tenant, inquiry, { select = [], filter = '', top = 0, skip = 0, orderBy = '' } = {}) {
   const base = String(instance || '').replace(/\/+$/, '');
   const t = encodeURIComponent(String(tenant || '').trim());
   const gi = encodeURIComponent(String(inquiry || '').trim());
   const q = [];
   if (select.length) q.push('$select=' + select.map((c) => encodeURIComponent(c)).join(','));
   if (filter) q.push('$filter=' + encodeURIComponent(filter));
+  /* $ORDERBY IS WHAT MAKES $SKIP MEAN ANYTHING. Paging an unordered result is undefined: the server
+     may return a row on page 2 that it already gave on page 1, and omit another entirely. Over
+     33,000 rows that is a silently short total nobody would question. Ordering on a unique column
+     (TranID for ALX_JobTrans) pins the sequence so page N+1 resumes where page N stopped. */
+  if (orderBy) q.push('$orderby=' + encodeURIComponent(orderBy));
   if (top) q.push('$top=' + Number(top));
   if (skip) q.push('$skip=' + Number(skip));
   return `${base}/t/${t}/api/odata/gi/${gi}${q.length ? '?' + q.join('&') : ''}`;
@@ -74,7 +79,7 @@ export function cookieHeader(setCookieValues = []) {
  */
 export async function readInquiry({
   instance, tenant, inquiry, user, pass,
-  select = [], filter = '', pageSize = 500, maxRows = 100000,
+  select = [], filter = '', orderBy = '', pageSize = 500, maxRows = 100000,
   fetchImpl = fetch,
 } = {}) {
   if (!instance || !tenant || !inquiry) throw new Error('readInquiry needs instance, tenant and inquiry');
@@ -84,8 +89,13 @@ export async function readInquiry({
   const rows = [];
   let cookie = '';
   let requests = 0;
+  /* WAS THE WHOLE INQUIRY READ? Only a short page proves it. Hitting maxRows instead means the
+     read stopped early, and the caller MUST know: a sweep after a truncated read deletes precisely
+     the projects the read never reached. syncActuals had `complete: true` hardcoded, which made its
+     own guard against that unreachable — so this is reported, not assumed. */
+  let complete = false;
   for (let skip = 0; rows.length < maxRows; skip += pageSize) {
-    const url = giUrl(instance, tenant, inquiry, { select, filter, top: pageSize, skip });
+    const url = giUrl(instance, tenant, inquiry, { select, filter, orderBy, top: pageSize, skip });
     const headers = { Authorization: auth, Accept: 'application/json' };
     /* ONE SESSION PER RUN — see the note at the top. */
     if (cookie) headers.Cookie = cookie;
@@ -107,40 +117,61 @@ export async function readInquiry({
     for (const r of page) rows.push(trimRow(r));
     /* A SHORT PAGE IS THE END. Asking again after one would loop for ever against a server that
        ignores $skip — which is exactly how a nightly job becomes an outage. */
-    if (page.length < pageSize) break;
+    if (page.length < pageSize) { complete = true; break; }
   }
-  return { rows: rows.slice(0, maxRows), requests, sessionReused: requests > 1 && !!cookie };
+  return { rows: rows.slice(0, maxRows), requests, complete, sessionReused: requests > 1 && !!cookie };
 }
 
 /* The actuals feed, rolled up to the grain the hub compares at.
  *
- * VelixoReportsPro-PMHistoryByDateMaster is per DATE, so a project/cost-code/period appears many
- * times. The hub shows budget-vs-actual per cost code, so the rows are summed to
- * (project, cost code, period) here rather than stored raw: it is the figure that gets displayed,
- * it keeps the table small, and rolling a job total out of it is trivial. Drill-down, when it is
- * wanted, comes from ALX_JobTrans on demand — that is a different question and a different read.
+ * WHY ALX_JobTrans AND NOT PMHistoryByDateMaster. The first attempt read
+ * VelixoReportsPro-PMHistoryByDateMaster, chosen from its column names, and the dry run against the
+ * live tenant (2026-09-10) killed it on two counts:
+ *
+ *   · Its ProjectID is an INTERNAL INTEGER (145, 129, 82) — not the 6931-style job code the same
+ *     column name returns in ALX_Projects. Keyed on that, every row would have matched no hub
+ *     project, and the hub would have shown no actuals on every job: indistinguishable from "the
+ *     feed isn't finished yet".
+ *   · Its rows span every account group, income as well as expense, so a project total came out at
+ *     10.7M — revenue and cost added together.
+ *
+ * ALX_JobTrans is Alclad's own inquiry and answers in the business's own terms: Project is the job
+ * CODE ("6931      ", padded — trimRow handles that), AccountGroup is a WORD (STAFF, MATERIAL), and
+ * CostCodeGrp names the package (CLADDING). It also carries the detail PMHistory never had —
+ * employee, supplier, PO reference, description — so drill-down is a filter on the same inquiry
+ * rather than a second integration.
+ *
+ * Amount vs Amount_2: identical in all 60 sample rows (base vs transaction currency, the same while
+ * the ledger is AUD-only). Amount is the one read; if they ever diverge that is a currency question
+ * worth answering deliberately, not silently.
+ *
+ * Amounts are PER-TRANSACTION MOVEMENTS, not running balances — verified on reversals that book the
+ * negative and the positive as separate rows (TranID 54170 +5343.84, 54172 -5343.75 on one sheet).
+ * So summing is correct, and a reversed cost nets to nothing exactly as the ledger intends.
  *
  * ⚠ A project with no MYOB row is NORMAL: 7336 Newcold is a quote, not a won job. Absence must
  * read as "not yet", never as a broken link. */
-export const ACTUALS_INQUIRY = 'VelixoReportsPro-PMHistoryByDateMaster';
-export const ACTUALS_SELECT = ['ProjectID', 'CostCodeID', 'AccountGroupID', 'FinPeriodID', 'ActualAmount', 'ActualQty'];
+export const ACTUALS_INQUIRY = 'ALX_JobTrans';
+export const ACTUALS_SELECT = ['Project', 'CostCode', 'AccountGroup', 'CostCodeGrp', 'FinPeriod', 'Amount', 'Qty', 'TranID'];
+/* Unique per transaction, so paging is deterministic — see the $orderby note in giUrl. */
+export const ACTUALS_ORDER = 'TranID';
 
 export function rollUpActuals(rows = []) {
   const by = new Map();
   for (const r of rows) {
-    const project = String(r.ProjectID ?? '').trim();
+    const project = String(r.Project ?? '').trim();
     if (!project) continue;              // a row with no project cannot be attributed to anything
-    const costCode = String(r.CostCodeID ?? '').trim();
-    const period = String(r.FinPeriodID ?? '').trim();
+    const costCode = String(r.CostCode ?? '').trim();
+    const period = String(r.FinPeriod ?? '').trim();
     const key = `${project}|${costCode}|${period}`;
     const cur = by.get(key) || {
-      project_id: project, cost_code: costCode, account_group: String(r.AccountGroupID ?? '').trim(),
+      project_id: project, cost_code: costCode, account_group: String(r.AccountGroup ?? '').trim(),
       fin_period: period, actual_amount: 0, actual_qty: 0, rows: 0,
     };
     /* Number(null) is 0 but Number(undefined) is NaN, and a NaN poisons the whole sum silently —
        so anything unparseable contributes nothing rather than destroying the total. */
-    const amt = Number(r.ActualAmount);
-    const qty = Number(r.ActualQty);
+    const amt = Number(r.Amount);
+    const qty = Number(r.Qty);
     cur.actual_amount += Number.isFinite(amt) ? amt : 0;
     cur.actual_qty += Number.isFinite(qty) ? qty : 0;
     cur.rows += 1;
@@ -153,4 +184,26 @@ export function rollUpActuals(rows = []) {
     actual_amount: Math.round(v.actual_amount * 100) / 100,
     actual_qty: Math.round(v.actual_qty * 10000) / 10000,
   }));
+}
+
+/* What each account group contributes, biggest first.
+ *
+ * The 10.7M figure was revenue and cost summed together, and nothing in the roll-up could have
+ * shown that — one number per project hides which groups made it. This breaks a read down by group
+ * so the dry run can say STAFF / MATERIAL / whatever else in the ledger, with a total each. If a
+ * group that is plainly income appears, it is visible before anything is written rather than
+ * discovered later in a project total that looks a bit high. */
+export function groupTotals(rows = []) {
+  const by = new Map();
+  for (const r of rows) {
+    const g = String(r.AccountGroup ?? '').trim() || '(none)';
+    const amt = Number(r.Amount);
+    const cur = by.get(g) || { account_group: g, amount: 0, rows: 0 };
+    cur.amount += Number.isFinite(amt) ? amt : 0;
+    cur.rows += 1;
+    by.set(g, cur);
+  }
+  return [...by.values()]
+    .map((v) => ({ ...v, amount: Math.round(v.amount * 100) / 100 }))
+    .sort((a, b) => Math.abs(b.amount) - Math.abs(a.amount));
 }
