@@ -66,6 +66,13 @@ const show = process.env.MYOB_SHOW === "1";
  * TRIMMED values because ProjectID comes back space-padded ("0018      "), which is exactly the
  * kind of difference that makes a join quietly match nothing. */
 const finds = (process.env.MYOB_FIND || "").split(",").map((f) => f.trim()).filter(Boolean);
+/* MYOB_FILTER passes an OData $filter through, e.g. ProjectID eq 145.
+ *
+ * Needed for the question the first dry run raised: PMHistoryByDateMaster's ActualAmount might be
+ * a per-period movement or a running balance, and summing a running balance across dates
+ * multiplies the total. One project's rows, in period order, settles it — and a filter is the only
+ * way to see one project's rows without pulling thirty thousand. */
+const filter = process.env.MYOB_FILTER || "";
 /* MYOB_HEADERS=1 dumps the response headers of the first success.
  *
  * Jed cannot reach MYOB or Velixo right now and asked whether the licence question can be settled
@@ -83,6 +90,7 @@ console.log(`\nMYOB OData probe — the surface an Excel add-in reads\n${instanc
 console.log(`tenant: ${tenants.length ? tenants.join(" | ") : "(unset — tenant-scoped addresses skipped, not guessed)"}`);
 console.log(`inquiry: ${gis.length ? gis.join(" | ") : "(unset — the service document still lists what is exposed)"}`);
 console.log(`credentials: ${user && pass ? `Basic as ${user}` : "NONE — set MYOB_ODATA_USER / MYOB_ODATA_PASS"}`);
+console.log(`filter: ${filter || "(none)"}`);
 console.log(`rows: $top=${top}${show ? " · MYOB_SHOW=1, values will be printed" : " · columns only (MYOB_SHOW=1 to print values)"}${finds.length ? ` · looking for ${finds.join(", ")}` : ""}`);
 
 /* Anonymous first, deliberately. If the service document answers without credentials that is
@@ -126,7 +134,10 @@ for (const [mode, header] of modes) {
        "GI (classic)" four times over says nothing about which answered. */
     if (g && c.label.startsWith('GI')) label = `GI ${g.slice(0, 26)}`;
     try {
-      const url = c.url.replace("$top=1", `$top=${top}`);
+      let url = c.url.replace("$top=1", `$top=${top}`);
+      if (filter && c.label.startsWith('GI')) {
+        url += (url.includes("?") ? "&" : "?") + "$filter=" + encodeURIComponent(filter);
+      }
       const res = await fetch(url, {
         headers: { Accept: "application/json", ...(header ? { Authorization: header } : {}) },
       });
