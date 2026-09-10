@@ -49,6 +49,7 @@ export function shouldSweep({ complete, rowsWritten }) {
 export function toTableRows(rolled, syncedAt) {
   return rolled.map((r) => ({
     project_id: r.project_id,
+    project_name: r.project_name || '',
     cost_code: r.cost_code,
     account_group: r.account_group,
     fin_period: r.fin_period,

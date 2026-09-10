@@ -156,7 +156,7 @@ test("missing credentials is refused before any request is made", async () => {
 // ── the roll-up ───────────────────────────────────────────────────────────
 test("the actuals select asks for exactly the columns stored", () => {
   assert.deepEqual(ACTUALS_SELECT,
-    ["Project", "CostCode", "AccountGroup", "CostCodeGrp", "FinPeriod", "Amount", "Qty", "TranID"]);
+    ["Project", "ProjectName", "CostCode", "AccountGroup", "CostCodeGrp", "FinPeriod", "Amount", "Qty", "TranID"]);
 });
 
 test("per-transaction rows sum to one row per project, cost code and period", () => {

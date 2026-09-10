@@ -162,7 +162,12 @@ export async function readInquiry({
  * ⚠ A project with no MYOB row is NORMAL: 7336 Newcold is a quote, not a won job. Absence must
  * read as "not yet", never as a broken link. */
 export const ACTUALS_INQUIRY = 'ALX_JobTrans';
-export const ACTUALS_SELECT = ['Project', 'CostCode', 'AccountGroup', 'CostCodeGrp', 'FinPeriod', 'Amount', 'Qty', 'TranID'];
+/* ProjectName is carried because a NUMBER alone cannot tell you that two MYOB jobs are one real
+   job. Alclad numbers some jobs once per package (glazing 6930, cladding 6931) while the hub holds
+   the lower number, so a link made on the number alone would silently omit a package's cost — a
+   figure that looks entirely plausible and is short by a whole scope. With the name stored, sibling
+   numbers can be spotted and linked deliberately. */
+export const ACTUALS_SELECT = ['Project', 'ProjectName', 'CostCode', 'AccountGroup', 'CostCodeGrp', 'FinPeriod', 'Amount', 'Qty', 'TranID'];
 /* Unique per transaction, so paging is deterministic — see the $orderby note in giUrl. */
 export const ACTUALS_ORDER = 'TranID';
 
@@ -227,8 +232,14 @@ export function rollUpActuals(rows = [], { costGroups = null } = {}) {
     const key = `${project}|${costCode}|${period}`;
     const cur = by.get(key) || {
       project_id: project, cost_code: costCode, account_group: String(r.AccountGroup ?? '').trim(),
+      /* MYOB's own description of the job. Blank rather than null so a reader never has to handle
+         both, and first-seen-wins: if the name were edited mid-period the figures are the same job
+         either way, and the linker only needs it to recognise siblings. */
+      project_name: String(r.ProjectName ?? '').trim(),
       fin_period: period, actual_amount: 0, actual_qty: 0, rows: 0,
     };
+    /* A later row can fill a name an earlier one lacked, but never blank one that is already set. */
+    if (!cur.project_name) cur.project_name = String(r.ProjectName ?? '').trim();
     /* Number(null) is 0 but Number(undefined) is NaN, and a NaN poisons the whole sum silently —
        so anything unparseable contributes nothing rather than destroying the total. */
     const amt = Number(r.Amount);

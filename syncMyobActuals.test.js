@@ -172,7 +172,7 @@ test("the read is asked for the actuals inquiry, with only the columns stored", 
      internal integer that joins to no hub project, and that its rows mix income with cost. */
   assert.equal(asked.inquiry, "ALX_JobTrans");
   assert.deepEqual(asked.select,
-    ["Project", "CostCode", "AccountGroup", "CostCodeGrp", "FinPeriod", "Amount", "Qty", "TranID"]);
+    ["Project", "ProjectName", "CostCode", "AccountGroup", "CostCodeGrp", "FinPeriod", "Amount", "Qty", "TranID"]);
   assert.equal(asked.orderBy, "TranID", "paging $skip without an order can drop rows");
   assert.equal(asked.tenant, CREDS.tenant);
 });
