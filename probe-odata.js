@@ -149,6 +149,14 @@ for (const [mode, header] of modes) {
         const ch = res.headers.get("www-authenticate");
         if (ch) detail = `wants: ${ch.slice(0, 70)} · ${note}`;
       }
+      /* THE ERROR BODY, for the statuses whose meaning is IN it. A 400 from a bad $filter says
+         which function is unsupported and where — and readOdataStatus has nothing to say about
+         400 at all, so without this the row printed an empty note and cost a round trip to
+         diagnose. 401/403/404 already have a reading; their bodies add nothing. */
+      if (res.status >= 400 && ![401, 403, 404].includes(res.status)) {
+        const body = await res.text().catch(() => "");
+        if (body.trim()) detail = body.replace(/\s+/g, " ").slice(0, 160);
+      }
       if (res.status === 200 && dumpHeaders && !headersShown) {
         headersShown = true;
         console.log("\nRESPONSE HEADERS (first success) — look for rate limits, quotas, licence hints:");
