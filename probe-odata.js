@@ -77,6 +77,7 @@ if (user && pass) {
 const passes = tenants.length ? tenants.map((t) => t) : [""];
 const seen = new Set();
 const rows = [];
+const exposed = [];   // [label, [inquiry names]] for every catalogue that answered
 for (const [mode, header] of modes) {
   for (const t of passes) {
   for (const c of odataCandidates(instance, t, gi)) {
@@ -99,7 +100,17 @@ for (const [mode, header] of modes) {
       }
       if (res.status === 200) {
         const text = await res.text().catch(() => "");
-        detail = text.replace(/\s+/g, " ").slice(0, 110) + "…";
+        detail = text.replace(/\s+/g, " ").slice(0, 90) + "…";
+        /* WHAT IS ACTUALLY EXPOSED. A service document / GI catalogue answers with the list of
+           readable inquiries, and that list is the whole point: it decides whether the actuals
+           the hub needs are already available or whether a Generic Inquiry has to be exposed
+           first. Both shapes put the names in value[].name. Collected rather than printed here so
+           the table stays a table. */
+        try {
+          const j = JSON.parse(text);
+          const names = (j.value || []).map((v) => v && (v.name || v.url)).filter(Boolean);
+          if (names.length) exposed.push([label, names]);
+        } catch { /* not a catalogue — a data payload, which is fine */ }
       }
       rows.push([mode, label, `${res.status} ${verdict}`, detail]);
     } catch (e) {
@@ -121,6 +132,18 @@ const open = basic.filter((r) => /OPEN/.test(r[2]));
 const auth = basic.filter((r) => /AUTH/.test(r[2]));
 const refused = basic.filter((r) => /REFUSED/.test(r[2]));
 const anonReachable = rows.some((r) => r[0] === "none" && !/UNREACHABLE|NO SUCH URL/.test(r[2]));
+
+/* THE LIST. When a catalogue answers, what it lists is the actionable finding: it names every
+   inquiry this credential can read, which is what decides whether the hub can be fed today or
+   whether a Generic Inquiry has to be exposed in MYOB first. */
+if (exposed.length) {
+  for (const [label, names] of exposed) {
+    console.log(`\nEXPOSED via ${label} — ${names.length} readable:`);
+    const show = names.slice(0, 60);
+    for (const n of show) console.log(`  ${n}`);
+    if (names.length > show.length) console.log(`  …and ${names.length - show.length} more`);
+  }
+}
 
 console.log("");
 if (open.length) {
