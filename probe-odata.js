@@ -44,13 +44,18 @@ if (!instance) {
    Empty means the tenant-scoped shapes are skipped entirely, as before. */
 const tenants = (process.env.MYOB_TENANT || "").split(",").map((t) => t.trim()).filter(Boolean);
 const tenant = tenants[0] || "";
-const gi = process.env.MYOB_GI || "";
+/* A LIST too. 87 inquiries are exposed on this tenant, so the useful question is which of a
+   handful carries the columns the hub needs — and inspecting them one run at a time is the same
+   avoidable round trip that guessing tenants was.
+     $env:MYOB_GI = "ALX_JobTrans,VelixoReportsPro-PMHistoryByDateMaster,ALX_Projects" */
+const gis = (process.env.MYOB_GI || "").split(",").map((g) => g.trim()).filter(Boolean);
+const gi = gis[0] || "";
 const user = process.env.MYOB_ODATA_USER || "";
 const pass = process.env.MYOB_ODATA_PASS || "";
 
 console.log(`\nMYOB OData probe — the surface an Excel add-in reads\n${instance}`);
 console.log(`tenant: ${tenants.length ? tenants.join(" | ") : "(unset — tenant-scoped addresses skipped, not guessed)"}`);
-console.log(`inquiry: ${gi || "(unset — the service document still lists what is exposed)"}`);
+console.log(`inquiry: ${gis.length ? gis.join(" | ") : "(unset — the service document still lists what is exposed)"}`);
 console.log(`credentials: ${user && pass ? `Basic as ${user}` : "NONE — set MYOB_ODATA_USER / MYOB_ODATA_PASS"}`);
 
 /* Anonymous first, deliberately. If the service document answers without credentials that is
@@ -78,14 +83,19 @@ const passes = tenants.length ? tenants.map((t) => t) : [""];
 const seen = new Set();
 const rows = [];
 const exposed = [];   // [label, [inquiry names]] for every catalogue that answered
+const columns = [];   // [label, [field names]] for every inquiry that returned a row
 for (const [mode, header] of modes) {
   for (const t of passes) {
-  for (const c of odataCandidates(instance, t, gi)) {
+  for (const g of (gis.length ? gis : [""])) {
+  for (const c of odataCandidates(instance, t, g)) {
     /* An un-scoped address is identical for every candidate — ask it once. */
     const key = `${mode}|${c.url}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    const label = t && c.label.includes('tenant') ? `${c.label} ${t.slice(0, 10)}` : c.label;
+    let label = t && c.label.includes('tenant') ? `${c.label} ${t.slice(0, 10)}` : c.label;
+    /* Name the inquiry rather than the route when one was asked for — with several in a run,
+       "GI (classic)" four times over says nothing about which answered. */
+    if (g && c.label.startsWith('GI')) label = `GI ${g.slice(0, 26)}`;
     try {
       const res = await fetch(c.url, {
         headers: { Accept: "application/json", ...(header ? { Authorization: header } : {}) },
@@ -108,14 +118,25 @@ for (const [mode, header] of modes) {
            the table stays a table. */
         try {
           const j = JSON.parse(text);
-          const names = (j.value || []).map((v) => v && (v.name || v.url)).filter(Boolean);
-          if (names.length) exposed.push([label, names]);
-        } catch { /* not a catalogue — a data payload, which is fine */ }
+          const first = (j.value || [])[0];
+          /* A CATALOGUE lists inquiries (value[].name); a DATA row is the inquiry's own fields.
+             The fields decide whether an inquiry carries what the hub needs, so they are worth
+             far more than a truncated blob of the row — and printing the row would put ledger
+             figures in a terminal for no reason. */
+          if (!g && first && (first.name || first.url)) {
+            const names = (j.value || []).map((v) => v && (v.name || v.url)).filter(Boolean);
+            if (names.length) exposed.push([label, names]);
+          } else if (first && typeof first === 'object') {
+            columns.push([label, Object.keys(first)]);
+            detail = `${(j.value || []).length} row(s), ${Object.keys(first).length} column(s)`;
+          }
+        } catch { /* not JSON — the raw sample above already says so */ }
       }
       rows.push([mode, label, `${res.status} ${verdict}`, detail]);
     } catch (e) {
       rows.push([mode, label, "UNREACHABLE", String((e && e.message) || e).slice(0, 90)]);
     }
+  }
   }
   }
 }
@@ -139,10 +160,15 @@ const anonReachable = rows.some((r) => r[0] === "none" && !/UNREACHABLE|NO SUCH 
 if (exposed.length) {
   for (const [label, names] of exposed) {
     console.log(`\nEXPOSED via ${label} — ${names.length} readable:`);
-    const show = names.slice(0, 60);
+    const show = names;   // all of them: finding the one that fits is the point
     for (const n of show) console.log(`  ${n}`);
-    if (names.length > show.length) console.log(`  …and ${names.length - show.length} more`);
   }
+}
+
+/* The columns of each inquiry asked for — the finding that decides which one feeds the hub. */
+for (const [label, cols] of columns) {
+  console.log(`\nCOLUMNS of ${label} — ${cols.length}:`);
+  console.log('  ' + cols.join(', '));
 }
 
 console.log("");
