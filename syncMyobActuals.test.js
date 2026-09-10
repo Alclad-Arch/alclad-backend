@@ -404,9 +404,10 @@ test("the budget inquiry is read, and written to its own table", async () => {
   const b = db.state.upserts.find((u) => u.rows[0] && 'contract_value' in u.rows[0]);
   assert.ok(b, "a budget upsert happened");
   assert.equal(b.opts.onConflict, "project_id,package_type", "the budget grain, not the ledger's");
-  /* THE FIGURE THAT MUST NOT BE SUMMED ACROSS SIDES. 4,522,726.66 is right;
-     1,381,094.70 is what summing all rows would give, and it looks plausible. */
-  assert.equal(b.rows[0].contract_value, 4522726.66);
+  /* Revenue plus NET variations: 4,011,186.35 + (511,540.31 − 355,478.48). Computed from the
+     components, never from ContractValueIncVar — summing that column gives 1,381,094.70, which
+     would look entirely plausible on a card. */
+  assert.equal(b.rows[0].contract_value, 4167248.18);
   assert.equal(b.rows[0].budget_cost, 2786153.48);
   assert.equal(b.rows[0].project_id, "3817", "trimmed");
   assert.equal(b.rows[0].package_scope, "Recladding", "Type R mapped to the hub's vocabulary");
@@ -436,18 +437,18 @@ test("a job with NO cost budget is counted as such", async () => {
   assert.equal(out.withCostBudget, 0);
 });
 
-test("an unclassified group in the BUDGET inquiry refuses the whole sync", async () => {
-  /* Either new revenue, which inflates a contract value, or new cost, which is missing from a
-     budget. Thrown before any write, so the pair cannot be half-updated. */
-  const db = fakeDb();
-  await assert.rejects(
-    () => syncActuals(db, {
-      creds: CREDS,
-      read: oneRead([], true, GROUPS, [{ ...BUDGET_ROWS[0], AccountGroupID: 'FREIGHT' }]),
-    }),
-    /FREIGHT/);
-  assert.equal(db.state.upserts.length, 0, "nothing was written at all");
-  assert.equal(db.state.deletes.length, 0);
+test("the budget read does NOT depend on the account-group classification", async () => {
+  /* An earlier version split this inquiry's columns by account-group side and refused on an
+     unclassified group. Both were wrong: job 6931 carries its 69,110 contract value on a SUBCONT
+     row — an EXPENSE group — and the split discarded the contract value of 160 of 165 jobs.
+     Every figure here is additive and belongs to the row it sits on, so an unfamiliar group name
+     cannot change the answer and must not stop the sync. */
+  const out = await syncActuals(fakeDb(), {
+    creds: CREDS,
+    read: oneRead([], true, GROUPS, [{ ...BUDGET_ROWS[0], AccountGroupID: 'FREIGHT' }]),
+  });
+  assert.equal(out.budgetWritten, 1, "written, not refused");
+  assert.equal(out.withContractValue, 1, "and its contract value counted");
 });
 
 test("the budget sweep is judged on the BUDGET read, not the ledger's", async () => {

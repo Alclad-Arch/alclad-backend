@@ -1,192 +1,208 @@
-// Contract value and budget per job, from ALX_JobAnalysis.
+// Contract value, budget and forecast per job, from ALX_JobAnalysis.
 //
-// The fixtures are job 3817's four REAL rows, as returned on 2026-09-10. That matters: the grain of
-// this inquiry is not obvious — revenue and cost figures sit on different rows, and which side a
-// row belongs to depends on its AccountGroupID — and an invented fixture would have encoded my
-// assumption about it rather than what MYOB actually sends.
+// The fixtures are REAL rows — job 6931's single row and job 3817's four — as returned on
+// 2026-09-10. That matters more than usual here, because an invented fixture is exactly how the
+// first version of this module went wrong: it split the columns by account-group side, job 3817
+// happens to be arranged that way, and the assumption looked verified. Job 6931 proved it false —
+// its BudgetRevenue of 69,110 sits on a SUBCONT row, an EXPENSE group — and the split had been
+// discarding the contract value of all but 5 of 165 jobs.
 //
-// The two numbers that prove the grain is understood are checked against a SECOND inquiry:
-// CostsToDate summed is 3,749,975.19 and InvoicedAmt is 3,890,777.47, which are exactly what
-// ALX_JobTrans reports as 3817's actual cost and actual income.
+// Three figures are checked against sources OUTSIDE this inquiry, which is what makes them
+// evidence rather than restatement:
+//   6931  BudgetRevenue 69,110.00      = Revised Contract Value on the MYOB Projects screen
+//   6931  CostsToDate   48,146.56      = myob_actuals.actual_cost, from ALX_JobTrans
+//   3817  CostsToDate   3,749,975.19   = myob_actuals.actual_cost, from ALX_JobTrans
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
   rollUpJobAnalysis, scopeForType, BUDGET_SELECT, BUDGET_INQUIRY, BUDGET_NUMERIC, TYPE_TO_SCOPE,
 } from "./myobJobAnalysis.js";
 
-/* The tenant's classification, as classifyGroups() returns it. */
-const COST = new Set(['STAFF', 'SUBCONT', 'MATERIAL', 'EQUIP', 'LABOUR', 'OTHER', 'CONSULT']);
-const INCOME = new Set(['GLAZING', 'CLADDING', 'RECLAD', 'FINS']);
-const SETS = { costGroups: COST, incomeGroups: INCOME };
+/* Job 6931, verbatim — one row, and every figure on it matches the MYOB Projects screen. */
+const J6931 = [{
+  Project: '6931      ', ProjectName: 'KM William Angliss', Type: 'C', Stage: 'Not Started',
+  ProjectManager: null,
+  BudgetRevenue: 69110, ContractVariations: 0, BudgetCost: 0,
+  InvoicedAmt: 0, CostsToDate: 48146.56, RetainedAmt: 0, PendingInvoiceAmt: 0,
+  DraftInvoicedAmt: 34555, ForecastGP: 39245.91, CostAtCompletion: 29864.09,
+  CostProjection: -23648.47, OpenCommittedAmt: 5366,
+  /* The row's AccountGroupID is SUBCONT — an EXPENSE group carrying the contract value. Kept in the
+     fixture precisely because it is what disproved the side-split. */
+  AccountGroupID: 'SUBCONT   ',
+}];
 
-/* Job 3817, verbatim. Padding included — MYOB sends AccountGroupID space-padded. */
+/* Job 3817, verbatim — four rows, the multi-row case. */
 const J3817 = [
   { Project: '3817      ', ProjectName: '181 William St & 550 Bourke St', Type: 'R', Stage: 'Completed',
     ProjectManager: 'BENSAIED Anouar, Mr', AccountGroupID: 'RECLAD    ',
-    BudgetRevenue: 4011186.35, ContractVariations: 511540.31, ContractValueIncVar: 4522726.66,
-    InvoicedAmt: 3890777.47, RetainedAmt: 0, PendingInvoiceAmt: 0, DraftInvoicedAmt: 0,
-    BudgetCost: 0, CostsToDate: 0, CostProjection: 0, CostAtCompletion: 0, OpenCommittedAmt: 0 },
+    BudgetRevenue: 4011186.35, ContractVariations: 511540.31, BudgetCost: 0,
+    InvoicedAmt: 3890777.47, CostsToDate: 0, CostAtCompletion: 0, ForecastGP: 4011186.35 },
   { Project: '3817      ', ProjectName: '181 William St & 550 Bourke St', Type: 'G', Stage: 'Completed',
     ProjectManager: 'BENSAIED Anouar, Mr', AccountGroupID: 'STAFF     ',
-    BudgetRevenue: 0, ContractVariations: 0, ContractValueIncVar: 0, InvoicedAmt: 0,
-    BudgetCost: 0, CostsToDate: 0, CostProjection: 0, CostAtCompletion: 0, OpenCommittedAmt: 0 },
+    BudgetRevenue: 0, ContractVariations: 0, BudgetCost: 0, InvoicedAmt: 0, CostsToDate: 0 },
   { Project: '3817      ', ProjectName: '181 William St & 550 Bourke St', Type: 'C', Stage: 'Completed',
     ProjectManager: 'BENSAIED Anouar, Mr', AccountGroupID: 'STAFF     ',
-    BudgetRevenue: 0, ContractVariations: 0, ContractValueIncVar: 0, InvoicedAmt: 0,
-    BudgetCost: 0, CostsToDate: 4800, CostProjection: -4800, CostAtCompletion: 0, OpenCommittedAmt: 0 },
+    BudgetRevenue: 0, ContractVariations: 0, BudgetCost: 0, InvoicedAmt: 0, CostsToDate: 4800,
+    CostProjection: -4800 },
   { Project: '3817      ', ProjectName: '181 William St & 550 Bourke St', Type: 'R', Stage: 'Completed',
     ProjectManager: 'BENSAIED Anouar, Mr', AccountGroupID: 'SUBCONT   ',
-    BudgetRevenue: 0, ContractVariations: -355478.48, ContractValueIncVar: -3141631.96, InvoicedAmt: 0,
-    BudgetCost: 2786153.48, CostsToDate: 3745175.19, CostProjection: -57182.48,
-    CostAtCompletion: 3687992.71, OpenCommittedAmt: 0 },
+    BudgetRevenue: 0, ContractVariations: -355478.48, BudgetCost: 2786153.48,
+    InvoicedAmt: 0, CostsToDate: 3745175.19, CostAtCompletion: 3687992.71,
+    ForecastGP: -3687992.71, CostProjection: -57182.48 },
 ];
 
 const total = (rows, field) => Math.round(rows.reduce((n, r) => n + r[field], 0) * 100) / 100;
 
-// ── the inquiry and its columns ───────────────────────────────────────────
-test("reads ALX_JobAnalysis, and asks for the grain plus both sides", () => {
+// ── the inquiry ───────────────────────────────────────────────────────────
+test("reads ALX_JobAnalysis and does NOT request ContractValueIncVar", () => {
   assert.equal(BUDGET_INQUIRY, 'ALX_JobAnalysis');
-  for (const c of ['Project', 'Type', 'AccountGroupID', 'ContractValueIncVar', 'BudgetCost', 'Stage']) {
+  /* Not fetching it is the point: its name says contract value and its formula is
+     BudgetRevenue - BudgetCost + ContractVariations, which is gross profit. Having it in hand
+     would invite someone to use it for the one thing it must never be used for. */
+  assert.ok(!BUDGET_SELECT.includes('ContractValueIncVar'));
+  for (const c of ['Project', 'Type', 'BudgetRevenue', 'ContractVariations', 'BudgetCost', 'Stage']) {
     assert.ok(BUDGET_SELECT.includes(c), `${c} must be selected`);
   }
-  /* AccountGroupID is what decides which side a row's figures belong to — without it every figure
-     is unattributable and the roll-up is guesswork. */
-  assert.ok(BUDGET_SELECT.includes('AccountGroupID'));
 });
 
-// ── THE TWO CROSS-CHECKS AGAINST ALX_JobTrans ────────────────────────────
-test("CostsToDate sums to 3817's actual cost, as ALX_JobTrans reports it", () => {
-  /* 3,749,975.19 from a different inquiry entirely. Agreement to the cent is what says the grain is
-     understood rather than assumed. */
-  const { rows } = rollUpJobAnalysis(J3817, SETS);
-  assert.equal(total(rows, 'costs_to_date'), 3749975.19);
+// ── 6931: verified against the MYOB screen, figure by figure ─────────────
+test("6931's contract value is 69,110 — the Revised Contract Value on the MYOB screen", () => {
+  const [r] = rollUpJobAnalysis(J6931);
+  assert.equal(r.contract_value, 69110);
+  assert.equal(r.budget_revenue, 69110);
+  assert.equal(r.contract_variations, 0);
 });
 
-test("InvoicedAmt matches 3817's actual income", () => {
-  const { rows } = rollUpJobAnalysis(J3817, SETS);
-  assert.equal(total(rows, 'invoiced'), 3890777.47);
+test("…and it is read from a row whose AccountGroupID is an EXPENSE group", () => {
+  /* THE TEST THAT KILLS THE OLD MODEL. Reading revenue only from Income-group rows would return 0
+     here, and did — for 160 of 165 jobs. */
+  assert.equal(J6931[0].AccountGroupID.trim(), 'SUBCONT');
+  assert.equal(rollUpJobAnalysis(J6931)[0].contract_value, 69110);
 });
 
-// ── THE TRAP: ContractValueIncVar is not summable ────────────────────────
-test("the contract value comes from INCOME rows only", () => {
-  /* Its formula is BudgetGP + ContractVariations, so on a cost row it is nonsense — row four of
-     3817 reads -3,141,631.96. Summed over all four rows it gives 1,381,094.70, which is not the
-     contract value and would look perfectly plausible on a project card. */
-  const { rows } = rollUpJobAnalysis(J3817, SETS);
-  assert.equal(total(rows, 'contract_value'), 4522726.66);
-  /* Spelled out, so the number this must NEVER be is in the file: */
-  const naive = J3817.reduce((n, r) => n + r.ContractValueIncVar, 0);
-  assert.equal(Math.round(naive * 100) / 100, 1381094.70, 'the wrong answer, for the record');
+test("…its costs to date match ALX_JobTrans, from a different inquiry entirely", () => {
+  assert.equal(rollUpJobAnalysis(J6931)[0].costs_to_date, 48146.56);
 });
 
-test("budget revenue and variations likewise come from the income side", () => {
-  const { rows } = rollUpJobAnalysis(J3817, SETS);
+test("…and MYOB's forecast comes through", () => {
+  const [r] = rollUpJobAnalysis(J6931);
+  assert.equal(r.forecast_gp, 39245.91, 'Projected GP $ on the screen');
+  assert.equal(r.cost_at_completion, 29864.09, 'Projected Cost at Completion');
+  assert.equal(r.draft_invoiced, 34555, 'Proforma Invoices');
+  assert.equal(r.open_committed, 5366);
+});
+
+test("…with no cost budget, which is the state Jed described", () => {
+  /* MYOB writes an unpopulated budget as 0.00, which is why its own screen reports this job at GP
+     100%. Stored as zero; the view marks it and nulls the GP. */
+  assert.equal(rollUpJobAnalysis(J6931)[0].budget_cost, 0);
+});
+
+test("a null ProjectManager does not become the string 'null'", () => {
+  /* 6931's is null. Coercing it would put "null" on a project card. */
+  assert.equal(rollUpJobAnalysis(J6931)[0].project_manager, '');
+});
+
+// ── 3817: the multi-row case, cross-checked ──────────────────────────────
+test("3817's costs to date sum to 3,749,975.19 — ALX_JobTrans agrees to the cent", () => {
+  /* The proof that the rows are additive slices rather than repeated totals. */
+  assert.equal(total(rollUpJobAnalysis(J3817), 'costs_to_date'), 3749975.19);
+});
+
+test("…and its invoiced amount matches too", () => {
+  assert.equal(total(rollUpJobAnalysis(J3817), 'invoiced'), 3890777.47);
+});
+
+test("…budget cost sums across the rows that carry it", () => {
+  assert.equal(total(rollUpJobAnalysis(J3817), 'budget_cost'), 2786153.48);
+});
+
+test("…and the contract value nets the variations", () => {
+  /* 4,011,186.35 + (511,540.31 − 355,478.48). ⚠ NOT verified against MYOB's screen for this job —
+     a single-row job cannot show whether a negative variation on a cost row belongs to the
+     contract. The components are stored separately so this stays checkable. */
+  const rows = rollUpJobAnalysis(J3817);
   assert.equal(total(rows, 'budget_revenue'), 4011186.35);
-  /* Note the cost row carries a NEGATIVE variation (-355,478.48). Including it would understate the
-     contract by a third of a million. */
-  assert.equal(total(rows, 'contract_variations'), 511540.31);
+  assert.equal(total(rows, 'contract_variations'), 156061.83);
+  assert.equal(total(rows, 'contract_value'), 4167248.18);
 });
 
-test("budget cost and costs come from the expense side", () => {
-  const { rows } = rollUpJobAnalysis(J3817, SETS);
-  assert.equal(total(rows, 'budget_cost'), 2786153.48);
-  assert.equal(total(rows, 'cost_at_completion'), 3687992.71);
+test("the figure ContractValueIncVar would have given is NOT produced", () => {
+  /* 1,381,094.70 is what summing that column yields, and it would look plausible on a card. Named
+     here so the number is in the file. */
+  assert.notEqual(total(rollUpJobAnalysis(J3817), 'contract_value'), 1381094.70);
 });
 
 // ── the grain ─────────────────────────────────────────────────────────────
 test("rolls up to project × package type", () => {
-  const { rows } = rollUpJobAnalysis(J3817, SETS);
-  /* Three types across four rows: R appears twice (income + subcontract cost). */
-  assert.equal(rows.length, 3);
+  const rows = rollUpJobAnalysis(J3817);
+  assert.equal(rows.length, 3, 'three types across four rows — R appears twice');
   assert.deepEqual(rows.map((r) => r.package_type).sort(), ['C', 'G', 'R']);
   const r = rows.find((x) => x.package_type === 'R');
-  assert.equal(r.contract_value, 4522726.66, 'the income and cost rows for R combine');
-  assert.equal(r.budget_cost, 2786153.48);
   assert.equal(r.source_rows, 2);
+  assert.equal(r.budget_cost, 2786153.48, "the R rows' figures combine");
 });
 
 test("the project id is trimmed — MYOB pads it", () => {
-  const { rows } = rollUpJobAnalysis(J3817, SETS);
-  assert.ok(rows.every((r) => r.project_id === '3817'), rows.map((r) => r.project_id).join(','));
+  assert.ok(rollUpJobAnalysis(J3817).every((r) => r.project_id === '3817'));
+  assert.equal(rollUpJobAnalysis(J6931)[0].project_id, '6931');
+});
+
+test("no account-group classification is needed or accepted", () => {
+  /* The signature takes rows only. An earlier version took the classification and used it to split
+     the columns by side, which is what discarded 160 contract values — passing one now cannot
+     change the answer because there is nothing to pass it to. */
+  /* 0, not 1: a parameter with a default does not count toward Function.length. Asserting 1 was
+     my own slip — the point stands, which is that there is no second parameter to pass a
+     classification to. */
+  assert.equal(rollUpJobAnalysis.length, 0);
+  assert.equal(rollUpJobAnalysis(J6931)[0].contract_value, 69110);
 });
 
 test("descriptive fields take the FIRST non-empty value", () => {
-  /* They repeat across a project's rows; first-wins is stable where last-wins depends on row
-     order, which the ledger does not guarantee. */
-  const { rows } = rollUpJobAnalysis([
+  const rows = rollUpJobAnalysis([
     { ...J3817[1], ProjectName: '', ProjectManager: '', Stage: '' },
     J3817[1],
-  ], SETS);
+  ]);
   assert.equal(rows[0].project_name, '181 William St & 550 Bourke St');
   assert.equal(rows[0].stage, 'Completed');
 });
 
 // ── the package mapping ───────────────────────────────────────────────────
 test("Type maps to the hub's scope vocabulary", () => {
-  assert.equal(scopeForType('G'), 'Glazing');
   assert.equal(scopeForType('C'), 'Cladding');
+  assert.equal(scopeForType('G'), 'Glazing');
   assert.equal(scopeForType('R'), 'Recladding');
   assert.equal(scopeForType('F'), 'Fins');
   assert.deepEqual(Object.keys(TYPE_TO_SCOPE).sort(), ['C', 'F', 'G', 'R']);
+  /* 6931 is a cladding job and MYOB says Type C. */
+  assert.equal(rollUpJobAnalysis(J6931)[0].package_scope, 'Cladding');
 });
 
 test("an unrecognised Type is left BLANK, not guessed", () => {
-  /* A wrong package silently attributes a contract to the wrong scope, which is worse than an
-     unmapped one — that at least shows up as missing. */
+  /* A wrong package silently attributes a contract to the wrong scope — worse than an unmapped
+     one, which at least shows up as missing. */
   assert.equal(scopeForType('X'), '');
   assert.equal(scopeForType(''), '');
   assert.equal(scopeForType(null), '');
-  const { rows } = rollUpJobAnalysis([{ ...J3817[0], Type: 'X' }], SETS);
-  assert.equal(rows[0].package_scope, '');
-  assert.equal(rows[0].package_type, 'X', 'but the raw letter is kept, so it can be looked into');
-});
-
-// ── unclassified groups ───────────────────────────────────────────────────
-test("an AccountGroupID in neither set is REPORTED, not guessed", () => {
-  /* Either new revenue, which would inflate a contract value, or new cost, which would be missing
-     from a budget. Nothing here can tell which. */
-  const { rows, unknownGroups } = rollUpJobAnalysis([
-    ...J3817,
-    { ...J3817[0], AccountGroupID: 'FREIGHT', ContractValueIncVar: 99999 },
-  ], SETS);
-  assert.deepEqual(unknownGroups, ['FREIGHT']);
-  /* And its figures are NOT counted while it is unclassified. */
-  assert.equal(total(rows, 'contract_value'), 4522726.66);
-});
-
-test("a blank group is reported too", () => {
-  const { unknownGroups } = rollUpJobAnalysis([{ ...J3817[0], AccountGroupID: '' }], SETS);
-  assert.deepEqual(unknownGroups, ['(blank)']);
-});
-
-test("nothing unclassified means an empty list, not null", () => {
-  const { unknownGroups } = rollUpJobAnalysis(J3817, SETS);
-  assert.deepEqual(unknownGroups, []);
-});
-
-// ── zero is not absent ────────────────────────────────────────────────────
-test("a zero budget cost is stored as zero — the READER decides it means absent", () => {
-  /* Jed 2026-09-10: not all jobs have a cost budget yet. MYOB writes an unpopulated one as 0.00,
-     indistinguishable from a real zero, which is why 6931 reports GP 100%. Storing what MYOB says
-     and marking it downstream keeps the fact and the interpretation separate. */
-  const { rows } = rollUpJobAnalysis([J3817[0]], SETS);
-  assert.equal(rows[0].budget_cost, 0);
-  assert.equal(rows[0].contract_value, 4522726.66, 'while the revenue side is real');
+  const [r] = rollUpJobAnalysis([{ ...J6931[0], Type: 'X' }]);
+  assert.equal(r.package_scope, '');
+  assert.equal(r.package_type, 'X', 'the raw letter is kept, so it can be looked into');
 });
 
 // ── arithmetic safety ─────────────────────────────────────────────────────
 test("an unparseable figure contributes nothing rather than NaN", () => {
-  const { rows } = rollUpJobAnalysis([
-    { ...J3817[0], ContractValueIncVar: 'not a number' },
-    { ...J3817[0], ContractValueIncVar: undefined },
-    J3817[0],
-  ], SETS);
-  assert.equal(rows[0].contract_value, 4522726.66, 'the one good row survives intact');
+  const rows = rollUpJobAnalysis([
+    { ...J6931[0], BudgetRevenue: 'not a number' },
+    { ...J6931[0], BudgetRevenue: undefined },
+    J6931[0],
+  ]);
+  assert.equal(rows[0].budget_revenue, 69110, 'the one good row survives intact');
+  assert.equal(rows[0].contract_value, 69110);
 });
 
 test("every numeric field is present on every row, so no reader has to guard", () => {
-  const { rows } = rollUpJobAnalysis(J3817, SETS);
-  for (const r of rows) {
+  for (const r of [...rollUpJobAnalysis(J3817), ...rollUpJobAnalysis(J6931)]) {
     for (const f of BUDGET_NUMERIC) {
       assert.equal(typeof r[f], 'number', `${f} missing on ${r.project_id}|${r.package_type}`);
     }
@@ -194,6 +210,10 @@ test("every numeric field is present on every row, so no reader has to guard", (
 });
 
 test("a row with no project is dropped, not filed under blank", () => {
-  const { rows } = rollUpJobAnalysis([{ ...J3817[0], Project: '   ' }], SETS);
-  assert.equal(rows.length, 0);
+  assert.equal(rollUpJobAnalysis([{ ...J6931[0], Project: '   ' }]).length, 0);
+});
+
+test("no rows in, no rows out", () => {
+  assert.deepEqual(rollUpJobAnalysis([]), []);
+  assert.deepEqual(rollUpJobAnalysis(), []);
 });

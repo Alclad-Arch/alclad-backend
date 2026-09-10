@@ -166,14 +166,11 @@ export async function syncActuals(db, {
     user: creds.user, pass: creds.pass, select: BUDGET_SELECT, orderBy: BUDGET_ORDER,
     cookie: groupRead.cookie,
   });
-  const { rows: budgetRolled, unknownGroups: budgetStrays } =
-    rollUpJobAnalysis(budgetRead.rows, { costGroups, incomeGroups: income });
-  /* REFUSE, as the ledger read does. An unclassified group is either new revenue, which would
-     inflate a contract value, or new cost, which would be missing from a budget, and nothing here
-     can tell which. Thrown before ANY write, so a bad classification cannot half-update the pair. */
-  if (budgetStrays.length) {
-    throw new Error(`${BUDGET_INQUIRY} carries account group(s) not in ${GROUPS_INQUIRY}: ${budgetStrays.join(", ")} — refusing to sync`);
-  }
+  /* NO CLASSIFICATION. Every figure in this inquiry is additive and belongs to the row it sits on,
+     whatever that row AccountGroupID says: job 6931 carries its 69,110 contract value on a SUBCONT
+     row. An earlier version split the columns by account-group side and discarded the contract value
+     of 160 of 165 jobs for it. */
+  const budgetRolled = rollUpJobAnalysis(budgetRead.rows);
   const budgetTableRows = budgetRolled.map((r) => ({
     project_id: r.project_id,
     package_type: r.package_type,
