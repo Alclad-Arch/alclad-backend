@@ -66,6 +66,16 @@ const show = process.env.MYOB_SHOW === "1";
  * TRIMMED values because ProjectID comes back space-padded ("0018      "), which is exactly the
  * kind of difference that makes a join quietly match nothing. */
 const finds = (process.env.MYOB_FIND || "").split(",").map((f) => f.trim()).filter(Boolean);
+/* MYOB_HEADERS=1 dumps the response headers of the first success.
+ *
+ * Jed cannot reach MYOB or Velixo right now and asked whether the licence question can be settled
+ * from our side. Partly: the CONTRACT is not readable from here, but the wire says whether this
+ * request is being metered — rate-limit headers, quota counters, a licence hint. Their presence
+ * would mean usage is counted and we should stay modest; their absence means the server treats
+ * this like any other authenticated read from a licensed user, which is what Velixo's own traffic
+ * is. Evidence, not permission. */
+const dumpHeaders = process.env.MYOB_HEADERS === "1";
+let headersShown = false;
 const user = process.env.MYOB_ODATA_USER || "";
 const pass = process.env.MYOB_ODATA_PASS || "";
 
@@ -127,6 +137,11 @@ for (const [mode, header] of modes) {
       if (res.status === 401) {
         const ch = res.headers.get("www-authenticate");
         if (ch) detail = `wants: ${ch.slice(0, 70)} · ${note}`;
+      }
+      if (res.status === 200 && dumpHeaders && !headersShown) {
+        headersShown = true;
+        console.log("\nRESPONSE HEADERS (first success) — look for rate limits, quotas, licence hints:");
+        for (const [k, v] of res.headers) console.log(`  ${k}: ${String(v).slice(0, 120)}`);
       }
       if (res.status === 200) {
         const text = await res.text().catch(() => "");
