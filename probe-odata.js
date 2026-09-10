@@ -36,13 +36,20 @@ if (!instance) {
   process.exit(1);
 }
 
-const tenant = process.env.MYOB_TENANT || "";
+/* A LIST, comma-separated. The segment in an OData URL is the company/tenant ID from the login
+   screen's Company dropdown, which is sometimes the display name ("Alclad Architectural Live")
+   and sometimes a short code — and a wrong one 404s, which is explicitly not a rights answer. So
+   rather than one guess per round trip, try every candidate in one run:
+     $env:MYOB_TENANT = "Alclad Architectural Live,AlcladArchitectural,Alclad"
+   Empty means the tenant-scoped shapes are skipped entirely, as before. */
+const tenants = (process.env.MYOB_TENANT || "").split(",").map((t) => t.trim()).filter(Boolean);
+const tenant = tenants[0] || "";
 const gi = process.env.MYOB_GI || "";
 const user = process.env.MYOB_ODATA_USER || "";
 const pass = process.env.MYOB_ODATA_PASS || "";
 
 console.log(`\nMYOB OData probe — the surface an Excel add-in reads\n${instance}`);
-console.log(`tenant: ${tenant || "(unset — tenant-scoped addresses skipped, not guessed)"}`);
+console.log(`tenant: ${tenants.length ? tenants.join(" | ") : "(unset — tenant-scoped addresses skipped, not guessed)"}`);
 console.log(`inquiry: ${gi || "(unset — the service document still lists what is exposed)"}`);
 console.log(`credentials: ${user && pass ? `Basic as ${user}` : "NONE — set MYOB_ODATA_USER / MYOB_ODATA_PASS"}`);
 
@@ -56,14 +63,28 @@ if (user && pass) {
      `user@tenant` — a bare username then 401s exactly like a wrong password, which is a whole
      round trip wasted on a formatting convention. Tried automatically when a tenant is known and
      the username does not already carry one. */
-  if (tenant && !user.includes("@")) {
-    modes.push([`basic@t`, authHeader("basic", { user: `${user}@${tenant}`, pass })]);
+  /* One per candidate: with several tenant guesses, only trying the first would leave the right
+     one untested and report a 401 that looks like a wrong password. */
+  if (!user.includes("@")) {
+    for (const t of tenants) {
+      modes.push([`u@${t.slice(0, 4)}`, authHeader("basic", { user: `${user}@${t}`, pass })]);
+    }
   }
 }
 
+/* One pass per tenant candidate, plus a pass with no tenant so the un-scoped addresses are still
+   asked exactly once rather than repeated per candidate. */
+const passes = tenants.length ? tenants.map((t) => t) : [""];
+const seen = new Set();
 const rows = [];
 for (const [mode, header] of modes) {
-  for (const c of odataCandidates(instance, tenant, gi)) {
+  for (const t of passes) {
+  for (const c of odataCandidates(instance, t, gi)) {
+    /* An un-scoped address is identical for every candidate — ask it once. */
+    const key = `${mode}|${c.url}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const label = t && c.label.includes('tenant') ? `${c.label} ${t.slice(0, 10)}` : c.label;
     try {
       const res = await fetch(c.url, {
         headers: { Accept: "application/json", ...(header ? { Authorization: header } : {}) },
@@ -80,19 +101,22 @@ for (const [mode, header] of modes) {
         const text = await res.text().catch(() => "");
         detail = text.replace(/\s+/g, " ").slice(0, 110) + "…";
       }
-      rows.push([mode, c.label, `${res.status} ${verdict}`, detail]);
+      rows.push([mode, label, `${res.status} ${verdict}`, detail]);
     } catch (e) {
-      rows.push([mode, c.label, "UNREACHABLE", String((e && e.message) || e).slice(0, 90)]);
+      rows.push([mode, label, "UNREACHABLE", String((e && e.message) || e).slice(0, 90)]);
     }
+  }
   }
 }
 
-const w = (s, n) => String(s).padEnd(n);
-console.log("\n" + w("AUTH", 7) + w("ADDRESS", 22) + w("RESULT", 18) + "WHAT IT MEANS");
-console.log("-".repeat(112));
-for (const r of rows) console.log(w(r[0], 7) + w(r[1], 22) + w(r[2], 18) + r[3]);
+/* Truncated as well as padded: a label longer than its column pushes RESULT out of line and the
+   table stops being scannable, which is most of what a probe is for. */
+const w = (s, n) => String(s).slice(0, n - 1).padEnd(n);
+console.log("\n" + w("AUTH", 9) + w("ADDRESS", 34) + w("RESULT", 18) + "WHAT IT MEANS");
+console.log("-".repeat(118));
+for (const r of rows) console.log(w(r[0], 9) + w(r[1], 34) + w(r[2], 18) + r[3]);
 
-const basic = rows.filter((r) => r[0].startsWith("basic"));
+const basic = rows.filter((r) => r[0] !== "none");
 const open = basic.filter((r) => /OPEN/.test(r[2]));
 const auth = basic.filter((r) => /AUTH/.test(r[2]));
 const refused = basic.filter((r) => /REFUSED/.test(r[2]));
