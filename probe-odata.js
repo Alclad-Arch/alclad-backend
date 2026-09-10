@@ -156,7 +156,13 @@ for (const [mode, header] of modes) {
       }
       if (res.status === 200) {
         const text = await res.text().catch(() => "");
-        detail = text.replace(/\s+/g, " ").slice(0, 90) + "…";
+        /* AN EMPTY BODY WITH 200 is its own answer and must not print as "…". Three inquiries
+           (VelixoReportsPro-Projects, PM-Projects, PM-Project Summary) answered exactly that,
+           which is how an Acumatica GI behaves when it requires parameters — and "…" reads as
+           "something came back", which is the opposite of what happened. */
+        detail = text.trim()
+          ? text.replace(/\s+/g, " ").slice(0, 90) + "…"
+          : "200 with an EMPTY BODY — the inquiry likely requires parameters";
         /* WHAT IS ACTUALLY EXPOSED. A service document / GI catalogue answers with the list of
            readable inquiries, and that list is the whole point: it decides whether the actuals
            the hub needs are already available or whether a Generic Inquiry has to be exposed
