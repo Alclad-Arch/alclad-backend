@@ -13,7 +13,10 @@ import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
 import { syncActuals } from "./syncMyobActuals.js";
 import { readOdataCreds, describeCreds } from "./myobOdataCreds.js";
-import { readInquiry, rollUpActuals, groupTotals, ACTUALS_INQUIRY, ACTUALS_SELECT, ACTUALS_ORDER } from "./myobOdataRead.js";
+import {
+  readInquiry, rollUpActuals, groupTotals, classifyGroups, unknownGroups,
+  ACTUALS_INQUIRY, ACTUALS_SELECT, ACTUALS_ORDER, GROUPS_INQUIRY, GROUPS_SELECT,
+} from "./myobOdataRead.js";
 
 const dry = process.argv.includes("--dry-run");
 
@@ -44,11 +47,29 @@ try {
   if (dry) {
     /* The read, the roll-up, and what WOULD be written — with no writes and no sweep, so this is
        safe to run against prod while deciding whether the figures look right. */
+    /* Classification first, and the cookie threaded into the ledger read, so a dry run costs the
+       same ONE Acumatica session a real run does. */
+    const groupRead = await readInquiry({
+      instance: creds.instance, tenant: creds.tenant, inquiry: GROUPS_INQUIRY,
+      user: creds.user, pass: creds.pass, select: GROUPS_SELECT,
+    });
+    const { byCode, cost: costGroups, income } = classifyGroups(groupRead.rows);
+    console.log(`\ncost groups   : ${[...costGroups].sort().join(", ") || "(none — a real run would refuse)"}`);
+    console.log(`income groups : ${[...income].sort().join(", ") || "(none)"}   ← excluded`);
+
     const { rows, requests, sessionReused, complete } = await readInquiry({
       instance: creds.instance, tenant: creds.tenant, inquiry: ACTUALS_INQUIRY,
       user: creds.user, pass: creds.pass, select: ACTUALS_SELECT, orderBy: ACTUALS_ORDER,
+      cookie: groupRead.cookie,
     });
-    const rolled = rollUpActuals(rows);
+    /* Reported rather than thrown, because the whole point of a dry run is to SEE the problem. */
+    const strays = unknownGroups(rows, byCode);
+    if (strays.length) {
+      console.log(`\n⚠ the ledger carries group(s) ${GROUPS_INQUIRY} does not classify: ${strays.join(", ")}`);
+      console.log("  A real run would REFUSE — an unclassified group is either revenue that would");
+      console.log("  corrupt the totals or cost that would be missing from them.");
+    }
+    const rolled = rollUpActuals(rows, { costGroups });
     const projects = new Set(rolled.map((r) => r.project_id));
     console.log(`\nread ${rows.length} ledger row(s) in ${requests} request(s)${sessionReused ? " (one session)" : ""}`);
     console.log(`rolls up to ${rolled.length} figure(s) across ${projects.size} project(s)`);
@@ -62,18 +83,24 @@ try {
        cost summed together, and one number per project could never have shown that. Named groups
        (STAFF, MATERIAL, …) can be recognised or challenged before anything is written. */
     const groups = groupTotals(rows);
-    console.log(`\nby account group — anything here that is INCOME rather than cost does not belong:`);
+    console.log(`\nby account group — COST is what gets stored, income is excluded:`);
+    let costTotal = 0;
+    let incomeTotal = 0;
     for (const g of groups) {
-      console.log(`  ${g.account_group.padEnd(14)} ${g.amount.toFixed(2).padStart(16)}  (${g.rows} row(s))`);
+      const kind = costGroups.has(g.account_group) ? "cost"
+        : income.has(g.account_group) ? "INCOME — excluded" : "unclassified";
+      if (kind === "cost") costTotal += g.amount; else if (income.has(g.account_group)) incomeTotal += g.amount;
+      console.log(`  ${g.account_group.padEnd(12)} ${g.amount.toFixed(2).padStart(16)}  ${String(g.rows).padStart(6)} row(s)  ${kind}`);
     }
-    const all = groups.reduce((n, g) => n + g.amount, 0);
-    console.log(`  ${"TOTAL".padEnd(14)} ${all.toFixed(2).padStart(16)}`);
+    console.log(`\n  cost to be stored   ${costTotal.toFixed(2).padStart(16)}`);
+    console.log(`  income excluded     ${incomeTotal.toFixed(2).padStart(16)}`);
     /* A handful of projects by spend, so the figures can be eyeballed against MYOB before this is
        trusted. Deliberately a sample: the point is to sanity-check, not to reproduce the ledger. */
     const byProject = new Map();
     for (const r of rolled) byProject.set(r.project_id, (byProject.get(r.project_id) || 0) + r.actual_amount);
     const top = [...byProject.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10);
-    console.log(`\nlargest by actual cost — check a couple against MYOB:`);
+    console.log(`\nlargest by actual cost — check a couple against the Projects screen in MYOB`);
+    console.log(`(the figure to match is ACTUAL EXPENSES, not Actual Cost minus income):`);
     for (const [p, amt] of top) console.log(`  ${p.padEnd(12)} ${amt.toFixed(2)}`);
     console.log("\nNothing was written. Re-run without --dry-run to sync.\n");
   } else {

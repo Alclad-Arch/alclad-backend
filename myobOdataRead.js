@@ -85,14 +85,16 @@ export async function readInquiry({
      destructive (the read reports incomplete and the sweep refuses), but the failure is a silently
      stale hub, so give it real headroom and revisit with a period filter long before this. */
   select = [], filter = '', orderBy = '', pageSize = 500, maxRows = 1000000,
-  fetchImpl = fetch,
+  cookie: cookieIn = '', fetchImpl = fetch,
 } = {}) {
   if (!instance || !tenant || !inquiry) throw new Error('readInquiry needs instance, tenant and inquiry');
   if (!user || !pass) throw new Error('readInquiry needs a username and password');
   const auth = 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64');
 
   const rows = [];
-  let cookie = '';
+  /* Handed in when a run has already authenticated. Two inquiries would otherwise open two
+     sessions, and sessions are what the licence counts. */
+  let cookie = cookieIn;
   let requests = 0;
   /* WAS THE WHOLE INQUIRY READ? Only a short page proves it. Hitting maxRows instead means the
      read stopped early, and the caller MUST know: a sweep after a truncated read deletes precisely
@@ -124,7 +126,10 @@ export async function readInquiry({
        ignores $skip — which is exactly how a nightly job becomes an outage. */
     if (page.length < pageSize) { complete = true; break; }
   }
-  return { rows: rows.slice(0, maxRows), requests, complete, sessionReused: requests > 1 && !!cookie };
+  return {
+    rows: rows.slice(0, maxRows), requests, complete, cookie,
+    sessionReused: (requests > 1 || !!cookieIn) && !!cookie,
+  };
 }
 
 /* The actuals feed, rolled up to the grain the hub compares at.
@@ -161,11 +166,62 @@ export const ACTUALS_SELECT = ['Project', 'CostCode', 'AccountGroup', 'CostCodeG
 /* Unique per transaction, so paging is deterministic — see the $orderby note in giUrl. */
 export const ACTUALS_ORDER = 'TranID';
 
-export function rollUpActuals(rows = []) {
+/* Which account groups are COST, read from the tenant rather than hardcoded.
+ *
+ * The first sync summed every group and reported 10.7M on a single project: Alclad bills revenue
+ * through account groups named after the PACKAGES (GLAZING, CLADDING, RECLAD, FINS — all Income)
+ * and costs through groups named by CATEGORY (MATERIAL, STAFF, SUBCONT, EQUIP, LABOUR, OTHER,
+ * CONSULT — all Expense). Added together they cancel into a number that means nothing.
+ *
+ * A hardcoded list of the seven would silently drop a group added later, and a dropped cost group
+ * reads as an underspent job — the kind of wrong nobody queries. So the Type column decides, and a
+ * new group classified in MYOB works here with no code change.
+ *
+ * ⚠ NOT filtered on Active. A deactivated group still has history, and historic costs are still
+ * costs; excluding them would quietly shrink finished jobs. */
+export const GROUPS_INQUIRY = 'VelixoReportsPro-AccountGroups';
+export const GROUPS_SELECT = ['AccountGroupCD', 'Type', 'Active'];
+
+export function classifyGroups(rows = []) {
+  const byCode = new Map();
+  const cost = new Set();
+  const income = new Set();
+  for (const r of rows) {
+    const code = String(r.AccountGroupCD ?? '').trim();
+    if (!code) continue;
+    const type = String(r.Type ?? '').trim().toLowerCase();
+    byCode.set(code, type);
+    if (type === 'expense') cost.add(code);
+    else if (type === 'income') income.add(code);
+  }
+  return { byCode, cost, income };
+}
+
+/* Groups present in the ledger that the classification has never heard of.
+ *
+ * This should be empty — both come from the same tenant. If it is not, the group is either new
+ * income (which would corrupt every total it touches) or new cost (which would be missing from
+ * them), and there is no safe way to guess which. The caller refuses to sync. */
+export function unknownGroups(rows = [], byCode = new Map()) {
+  const seen = new Set();
+  for (const row of rows) {
+    const code = String(row.AccountGroup ?? '').trim();
+    /* A BLANK GROUP COUNTS AS UNKNOWN. It cannot be classified, so it would be filtered out of the
+       cost roll-up and disappear into the (large, expected) income exclusion without trace. */
+    if (!code) { seen.add('(blank)'); continue; }
+    if (!byCode.has(code)) seen.add(code);
+  }
+  return [...seen].sort();
+}
+
+export function rollUpActuals(rows = [], { costGroups = null } = {}) {
   const by = new Map();
   for (const r of rows) {
     const project = String(r.Project ?? '').trim();
     if (!project) continue;              // a row with no project cannot be attributed to anything
+    /* COST ONLY. Passing no set means no filtering, which is right for a caller that has already
+       filtered and wrong for the sync — syncActuals always passes one. */
+    if (costGroups && !costGroups.has(String(r.AccountGroup ?? '').trim())) continue;
     const costCode = String(r.CostCode ?? '').trim();
     const period = String(r.FinPeriod ?? '').trim();
     const key = `${project}|${costCode}|${period}`;

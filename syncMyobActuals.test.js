@@ -9,6 +9,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { syncActuals, chunk, shouldSweep, toTableRows, TABLE } from "./syncMyobActuals.js";
+import { GROUPS_INQUIRY } from "./myobOdataRead.js";
 
 const CREDS = {
   instance: "https://alcladarchitectural.myobadvanced.com",
@@ -37,7 +38,21 @@ const fakeDb = ({ upsertError = null, deleteError = null, deleted = [] } = {}) =
   };
 };
 
-const oneRead = (rows, complete = true) => async () => ({ rows, requests: 1, complete, sessionReused: false });
+/* The tenant's account-group classification: revenue by package, cost by category. */
+const GROUPS = [
+  { AccountGroupCD: "MATERIAL  ", Type: "Expense" },
+  { AccountGroupCD: "STAFF     ", Type: "Expense" },
+  { AccountGroupCD: "GLAZING   ", Type: "Income" },
+  { AccountGroupCD: "CLADDING  ", Type: "Income" },
+];
+
+/* A SYNC MAKES TWO READS: the classification, then the ledger. A fake that answers both with the
+   same rows is how the first version of these tests passed while classifying nothing. */
+const oneRead = (rows, complete = true, groups = GROUPS) => async (args) => (
+  args.inquiry === GROUPS_INQUIRY
+    ? { rows: groups, requests: 1, complete: true, cookie: "ASP.NET_SessionId=abc" }
+    : { rows, requests: 1, complete, cookie: args.cookie || "", sessionReused: !!args.cookie }
+);
 
 // ── chunking ──────────────────────────────────────────────────────────────
 test("chunking keeps every row, including the last partial one", () => {
@@ -87,9 +102,9 @@ test("a normal run upserts the rolled-up rows and then sweeps", async () => {
     creds: CREDS,
     now: () => "2026-09-10T00:00:00.000Z",
     read: oneRead([
-      { Project: "6667      ", CostCode: "2000202", FinPeriod: "022027", Amount: 100, Qty: 1 },
-      { Project: "6667      ", CostCode: "2000202", FinPeriod: "022027", Amount: 50, Qty: 1 },
-      { Project: "6931", CostCode: "2000102", FinPeriod: "022027", Amount: 25, Qty: 2 },
+      { Project: "6667      ", CostCode: "2000202", AccountGroup: "MATERIAL", FinPeriod: "022027", Amount: 100, Qty: 1 },
+      { Project: "6667      ", CostCode: "2000202", AccountGroup: "MATERIAL", FinPeriod: "022027", Amount: 50, Qty: 1 },
+      { Project: "6931", CostCode: "2000102", AccountGroup: "STAFF", FinPeriod: "022027", Amount: 25, Qty: 2 },
     ]),
   });
   assert.equal(out.read, 3);
@@ -121,7 +136,7 @@ test("a failed upsert throws BEFORE the sweep, and says how far it got", async (
   /* A partial write plus a sweep is the one combination that loses data rather than delaying it. */
   const db = fakeDb({ upsertError: { message: "timeout" } });
   await assert.rejects(
-    () => syncActuals(db, { creds: CREDS, read: oneRead([{ Project: "6667", Amount: 1 }]) }),
+    () => syncActuals(db, { creds: CREDS, read: oneRead([{ Project: "6667", AccountGroup: "STAFF", Amount: 1 }]) }),
     (e) => {
       assert.match(e.message, /upsert failed after 0 row\(s\)/);
       assert.equal(db.state.deletes.length, 0, "the sweep must not run after a failed write");
@@ -132,14 +147,14 @@ test("a failed upsert throws BEFORE the sweep, and says how far it got", async (
 test("a failed sweep is reported rather than swallowed", async () => {
   const db = fakeDb({ deleteError: { message: "nope" } });
   await assert.rejects(
-    () => syncActuals(db, { creds: CREDS, read: oneRead([{ Project: "6667", Amount: 1 }]) }),
+    () => syncActuals(db, { creds: CREDS, read: oneRead([{ Project: "6667", AccountGroup: "STAFF", Amount: 1 }]) }),
     /sweep failed/);
 });
 
 test("the report names WHO it connected as", async () => {
   /* While this runs under a personal login, the report is the record of that — and the thing that
      makes the eventual switch to a dedicated user visible rather than assumed. */
-  const out = await syncActuals(fakeDb(), { creds: CREDS, read: oneRead([{ Project: "1", Amount: 1 }]) });
+  const out = await syncActuals(fakeDb(), { creds: CREDS, read: oneRead([{ Project: "1", AccountGroup: "STAFF", Amount: 1 }]) });
   assert.equal(out.as, "nathan@alcladaus.com.au");
 });
 
@@ -147,7 +162,11 @@ test("the read is asked for the actuals inquiry, with only the columns stored", 
   let asked = null;
   await syncActuals(fakeDb(), {
     creds: CREDS,
-    read: async (args) => { asked = args; return { rows: [], requests: 1 }; },
+    read: async (args) => {
+      if (args.inquiry === GROUPS_INQUIRY) return { rows: GROUPS, requests: 1, complete: true, cookie: "c" };
+      asked = args;
+      return { rows: [], requests: 1, complete: true };
+    },
   });
   /* ALX_JobTrans, not PMHistoryByDateMaster. The dry run proved PMHistory's ProjectID is an
      internal integer that joins to no hub project, and that its rows mix income with cost. */
@@ -166,7 +185,7 @@ test("a TRUNCATED read writes its rows but must not sweep", async () => {
   const db = fakeDb({ deleted: [{ project_id: "never-reached" }] });
   const out = await syncActuals(db, {
     creds: CREDS,
-    read: oneRead([{ Project: "6931", CostCode: "2000102", FinPeriod: "022027", Amount: 10 }], false),
+    read: oneRead([{ Project: "6931", CostCode: "2000102", AccountGroup: "STAFF", FinPeriod: "022027", Amount: 10 }], false),
   });
   assert.equal(out.written, 1, "what was read is still written");
   assert.equal(out.swept, 0);
@@ -179,8 +198,92 @@ test("a reader that does not report completeness leaves rows alone", async () =>
   const db = fakeDb({ deleted: [{ project_id: "x" }] });
   const out = await syncActuals(db, {
     creds: CREDS,
-    read: async () => ({ rows: [{ Project: "6931", Amount: 5 }], requests: 1 }),
+    /* The classification read is normal; it is the LEDGER read that omits `complete`. */
+    read: async (args) => (args.inquiry === GROUPS_INQUIRY
+      ? { rows: GROUPS, requests: 1, complete: true, cookie: "c" }
+      : { rows: [{ Project: "6931", AccountGroup: "STAFF", Amount: 5 }], requests: 1 }),
   });
   assert.equal(out.swept, 0);
   assert.equal(db.state.deletes.length, 0);
+});
+
+// ── cost only, and refusing rather than guessing ──────────────────────────
+test("INCOME rows are excluded — this is the 10.7M bug", async () => {
+  /* Alclad bills revenue through groups named after the packages and costs through groups named by
+     category. Summed together, one project reported 10,734,945.75. */
+  const db = fakeDb();
+  const out = await syncActuals(db, {
+    creds: CREDS,
+    read: oneRead([
+      { Project: "6931", CostCode: "2000202", AccountGroup: "MATERIAL", FinPeriod: "022027", Amount: 1000, Qty: 1 },
+      { Project: "6931", CostCode: "2000202", AccountGroup: "GLAZING", FinPeriod: "022027", Amount: -5000, Qty: 0 },
+    ]),
+  });
+  assert.equal(out.rolled, 1, "the income row makes no figure of its own");
+  assert.equal(db.state.upserts[0].rows[0].actual_amount, 1000, "and does not net off the cost");
+});
+
+test("the report says which groups counted as cost and which as income", async () => {
+  /* The answer now comes from the tenant, so it has to be visible in the run rather than read out
+     of this file. */
+  const out = await syncActuals(fakeDb(), {
+    creds: CREDS,
+    read: oneRead([{ Project: "6931", AccountGroup: "STAFF", Amount: 1 }]),
+  });
+  assert.deepEqual(out.costGroups, ["MATERIAL", "STAFF"]);
+  assert.deepEqual(out.incomeGroups, ["CLADDING", "GLAZING"]);
+});
+
+test("NO Expense groups refuses to sync, and writes nothing", async () => {
+  /* Both fallbacks are wrong: every group files revenue as cost, no group empties the hub. */
+  const db = fakeDb();
+  await assert.rejects(
+    () => syncActuals(db, {
+      creds: CREDS,
+      read: oneRead([{ Project: "6931", AccountGroup: "STAFF", Amount: 1 }], true,
+        [{ AccountGroupCD: "GLAZING", Type: "Income" }]),
+    }),
+    /no Expense groups/);
+  assert.equal(db.state.upserts.length, 0);
+  assert.equal(db.state.deletes.length, 0);
+});
+
+test("a ledger group the classification has never heard of refuses to sync", async () => {
+  /* New income would corrupt every total it touches; new cost would be missing from them. Nothing
+     here can tell which, so it stops and names the group. */
+  const db = fakeDb();
+  await assert.rejects(
+    () => syncActuals(db, {
+      creds: CREDS,
+      read: oneRead([{ Project: "6931", AccountGroup: "FREIGHT", Amount: 1 }]),
+    }),
+    /FREIGHT/);
+  assert.equal(db.state.upserts.length, 0);
+});
+
+test("a BLANK account group refuses too, rather than vanishing", async () => {
+  /* It would be filtered out of the cost roll-up and disappear into the large, expected income
+     exclusion with nothing to show it had gone. */
+  await assert.rejects(
+    () => syncActuals(fakeDb(), {
+      creds: CREDS,
+      read: oneRead([{ Project: "6931", Amount: 999 }]),
+    }),
+    /\(blank\)/);
+});
+
+test("both reads share ONE session", async () => {
+  /* Sessions, not requests, are what the Acumatica licence counts. */
+  const seen = [];
+  await syncActuals(fakeDb(), {
+    creds: CREDS,
+    read: async (args) => {
+      seen.push({ inquiry: args.inquiry, cookie: args.cookie || null });
+      if (args.inquiry === GROUPS_INQUIRY) return { rows: GROUPS, requests: 1, complete: true, cookie: "SESS=1" };
+      return { rows: [], requests: 1, complete: true, cookie: args.cookie };
+    },
+  });
+  assert.equal(seen.length, 2);
+  assert.equal(seen[0].inquiry, GROUPS_INQUIRY, "classification first — without it nothing is safe to store");
+  assert.equal(seen[1].cookie, "SESS=1", "the ledger read reuses the session the first one opened");
 });

@@ -14,7 +14,10 @@
 //       every chunk having landed.
 //
 // The read itself is in myobOdataRead.js; the credential in myobOdataCreds.js.
-import { readInquiry, rollUpActuals, ACTUALS_INQUIRY, ACTUALS_SELECT, ACTUALS_ORDER } from "./myobOdataRead.js";
+import {
+  readInquiry, rollUpActuals, classifyGroups, unknownGroups,
+  ACTUALS_INQUIRY, ACTUALS_SELECT, ACTUALS_ORDER, GROUPS_INQUIRY, GROUPS_SELECT,
+} from "./myobOdataRead.js";
 import { readOdataCreds } from "./myobOdataCreds.js";
 
 export const TABLE = "myob_actuals";
@@ -67,12 +70,39 @@ export async function syncActuals(db, {
   const creds = given || await readOdataCreds(db, env);
   const syncedAt = now();
 
+  /* WHICH GROUPS ARE COST — read first, because without it there is nothing safe to store. Alclad
+     books revenue through account groups named after the packages (GLAZING, CLADDING, RECLAD,
+     FINS) and cost through groups named by category; summed together the first dry run reported
+     10.7M on one project. The cookie is threaded into the second read so both cost ONE session. */
+  const groupRead = await read({
+    instance: creds.instance, tenant: creds.tenant, inquiry: GROUPS_INQUIRY,
+    user: creds.user, pass: creds.pass, select: GROUPS_SELECT,
+  });
+  const { byCode, cost: costGroups, income } = classifyGroups(groupRead.rows);
+  /* REFUSE RATHER THAN GUESS. No cost groups means the inquiry was renamed, a permission was
+     withdrawn, or the Type column changed — and the two fallbacks are both wrong: storing every
+     group files revenue as cost, storing none empties the hub. Stale for a day is the only
+     acceptable failure here, and throwing before any write is what delivers it. */
+  if (!costGroups.size) {
+    throw new Error(`${GROUPS_INQUIRY} yielded no Expense groups (${groupRead.rows.length} row(s) read) — refusing to sync`);
+  }
+
   const { rows, requests, sessionReused, complete } = await read({
     instance: creds.instance, tenant: creds.tenant, inquiry: ACTUALS_INQUIRY,
     user: creds.user, pass: creds.pass, select: ACTUALS_SELECT, orderBy: ACTUALS_ORDER,
+    cookie: groupRead.cookie,
   });
 
-  const rolled = rollUpActuals(rows);
+  /* A GROUP THE CLASSIFICATION HAS NEVER HEARD OF. Both reads come from the same tenant, so this
+     should be impossible; if it happens the group is either new income (which would corrupt every
+     total it touches) or new cost (which would be missing from them), and nothing here can tell
+     which. Refuse, and say which group. */
+  const strays = unknownGroups(rows, byCode);
+  if (strays.length) {
+    throw new Error(`ledger carries account group(s) not in ${GROUPS_INQUIRY}: ${strays.join(", ")} — refusing to sync`);
+  }
+
+  const rolled = rollUpActuals(rows, { costGroups });
   const tableRows = toTableRows(rolled, syncedAt);
 
   let written = 0;
@@ -104,9 +134,13 @@ export async function syncActuals(db, {
     rolled: rolled.length,
     written,
     swept,
-    requests,
+    requests: requests + groupRead.requests,
     sessionReused,
     complete: complete === true,
+    /* Said out loud in the report, because "which groups counted as cost" is the question behind
+       every figure here and the answer now comes from the tenant rather than this file. */
+    costGroups: [...costGroups].sort(),
+    incomeGroups: [...income].sort(),
     syncedAt,
     as: creds.user,
     /* Named so a summary can say it out loud: the whole point of the roll-up is that these two
