@@ -323,7 +323,7 @@ test("guard ON skips when the data says it already ran today", async () => {
     read: async () => { readCalled = true; return { rows: [], requests: 1, complete: true }; },
   });
   assert.equal(out.skipped, true);
-  assert.match(out.reason, /under the 20h minimum/);
+  assert.match(out.reason, /under the 12h floor/);
   /* NOT ONE REQUEST TO MYOB. The guard has to decide before the session is opened, or it has
      already cost the thing it exists to protect. */
   assert.equal(readCalled, false, "MYOB must not be contacted at all");
