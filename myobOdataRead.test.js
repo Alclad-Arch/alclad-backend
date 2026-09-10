@@ -366,3 +366,31 @@ test("income reversals net out, like cost ones", () => {
   ], { costGroups: COST, incomeGroups: INCOME });
   assert.equal(out[0].income_amount, 0);
 });
+
+test("an income-only row leaves account_group BLANK", () => {
+  /* The hub renders that column as "Cost types". Seeding it with whatever group arrived first put
+     revenue in it: 6242 COS Melton DC displayed CLADDING,EQUIP,MATERIAL,OTHER,STAFF,SUBCONT on
+     screen, and CLADDING is an income group. income_amount already says revenue is present. */
+  const out = rollUpActuals([
+    { Project: '1', CostCode: 'C', AccountGroup: 'CLADDING', FinPeriod: 'P', Amount: -500 },
+  ], { costGroups: COST, incomeGroups: INCOME });
+  assert.equal(out[0].account_group, '');
+  assert.equal(out[0].income_amount, 500, 'the revenue is still counted');
+});
+
+test("a cost row sets it even when the income row came first", () => {
+  const out = rollUpActuals([
+    { Project: '1', CostCode: 'C', AccountGroup: 'CLADDING', FinPeriod: 'P', Amount: -500 },
+    { Project: '1', CostCode: 'C', AccountGroup: 'SUBCONT', FinPeriod: 'P', Amount: 20 },
+  ], { costGroups: new Set(['SUBCONT']), incomeGroups: INCOME });
+  assert.equal(out[0].account_group, 'SUBCONT');
+});
+
+test("the FIRST cost group wins, not the last", () => {
+  /* One column, one answer, and it has to be stable across runs — the ledger's row order is not. */
+  const out = rollUpActuals([
+    { Project: '1', CostCode: 'C', AccountGroup: 'STAFF', FinPeriod: 'P', Amount: 1 },
+    { Project: '1', CostCode: 'C', AccountGroup: 'MATERIAL', FinPeriod: 'P', Amount: 1 },
+  ], { costGroups: COST, incomeGroups: INCOME });
+  assert.equal(out[0].account_group, 'STAFF');
+});

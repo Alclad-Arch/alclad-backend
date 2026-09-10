@@ -241,7 +241,13 @@ export function rollUpActuals(rows = [], { costGroups = null, incomeGroups = nul
     const period = String(r.FinPeriod ?? '').trim();
     const key = `${project}|${costCode}|${period}`;
     const cur = by.get(key) || {
-      project_id: project, cost_code: costCode, account_group: group,
+      project_id: project, cost_code: costCode,
+      /* BLANK UNTIL A COST ROW SETS IT. Seeding this with whatever group arrived first put INCOME
+         groups into a column the hub renders as "Cost types" — 6242 COS Melton DC displayed
+         'CLADDING,EQUIP,MATERIAL,OTHER,STAFF,SUBCONT', and CLADDING is revenue. A reader would take
+         it for a cost category. income_amount already says revenue is present; this column is only
+         ever about cost. */
+      account_group: '',
       /* MYOB's own description of the job. Blank rather than null so a reader never has to handle
          both, and first-seen-wins: if the name were edited mid-period the figures are the same job
          either way, and the linker only needs it to recognise siblings. */
@@ -254,7 +260,7 @@ export function rollUpActuals(rows = [], { costGroups = null, incomeGroups = nul
        income lines, and a single column cannot describe both — so a mixed row is labelled from the
        COST side, which is what the register's figure is about. The view exposes the full set of
        groups behind a project anyway, and income_amount being non-zero says the rest. */
-    if (isCost && !cur.account_group_is_cost) { cur.account_group = group; cur.account_group_is_cost = true; }
+    if (isCost && !cur.account_group) cur.account_group = group;
     /* Number(null) is 0 but Number(undefined) is NaN, and a NaN poisons the whole sum silently —
        so anything unparseable contributes nothing rather than destroying the total. */
     const amt = Number(r.Amount);
