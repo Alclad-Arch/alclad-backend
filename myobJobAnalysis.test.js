@@ -117,14 +117,41 @@ test("…budget cost sums across the rows that carry it", () => {
   assert.equal(total(rollUpJobAnalysis(J3817), 'budget_cost'), 2786153.48);
 });
 
-test("…and the contract value nets the variations", () => {
-  /* 4,011,186.35 + (511,540.31 − 355,478.48). ⚠ NOT verified against MYOB's screen for this job —
-     a single-row job cannot show whether a negative variation on a cost row belongs to the
-     contract. The components are stored separately so this stays checkable. */
+test("the contract value is BudgetRevenue, and does NOT add the variations again", () => {
+  /* Changed 2026-09-11. This asserted 4,167,248.18 — BudgetRevenue plus contract_variations — and
+     carried a note that it was "NOT verified against MYOB's screen for this job". It never could
+     have failed: the other test for this rule used job 6931, which has ZERO variations, so both
+     formulas agree there, and the cross-check for 3817 compared our sum against MYOB's
+     ContractValueIncVar, which is BudgetGP + ContractVariations — the same arithmetic, since
+     BudgetGP equals BudgetRevenue on an income row. Two tests, neither able to catch it.
+
+     Jed's screens caught it. BudgetRevenue is MYOB's REVISED contract value, variations already
+     in: on 5477, Original 2,350,000.00 + Revised Variation 2,460,337.21 = Revised Contract Value
+     4,810,337.21, which is exactly the BudgetRevenue we store for that job. */
   const rows = rollUpJobAnalysis(J3817);
   assert.equal(total(rows, 'budget_revenue'), 4011186.35);
+  assert.equal(total(rows, 'contract_value'), 4011186.35);
+  /* Still read and still stored — but nothing computes from it, and this asserts that. It is not
+     a variation total: it read 511,540.31 when 3817 was probed and 156,061.83 once synced, and on
+     6157 it was −14,823.01 against real change orders of +5,861.67. */
   assert.equal(total(rows, 'contract_variations'), 156061.83);
-  assert.equal(total(rows, 'contract_value'), 4167248.18);
+  assert.notEqual(total(rows, 'contract_value'), 4167248.18);
+});
+
+test("a job WITH variations proves the two formulas differ", () => {
+  /* The guard the old suite lacked. 6931 has no variations, so it cannot tell
+     `budget_revenue` from `budget_revenue + contract_variations` — which is exactly how the wrong
+     formula passed for a month. This row has a non-zero variations figure of each sign, so
+     reinstating the addition fails here immediately. */
+  for (const v of [250000, -250000]) {
+    const [r] = rollUpJobAnalysis([{
+      Project: '9001', ProjectName: 'Variations Ltd', Type: 'C',
+      AccountGroupID: 'CLAD', BudgetRevenue: 1000000, ContractVariations: v,
+    }]);
+    assert.equal(r.budget_revenue, 1000000);
+    assert.equal(r.contract_variations, v);
+    assert.equal(r.contract_value, 1000000, `contract_value moved with a variations figure of ${v}`);
+  }
 });
 
 test("the figure ContractValueIncVar would have given is NOT produced", () => {

@@ -404,10 +404,11 @@ test("the budget inquiry is read, and written to its own table", async () => {
   const b = db.state.upserts.find((u) => u.rows[0] && 'contract_value' in u.rows[0]);
   assert.ok(b, "a budget upsert happened");
   assert.equal(b.opts.onConflict, "project_id,package_type", "the budget grain, not the ledger's");
-  /* Revenue plus NET variations: 4,011,186.35 + (511,540.31 − 355,478.48). Computed from the
-     components, never from ContractValueIncVar — summing that column gives 1,381,094.70, which
-     would look entirely plausible on a card. */
-  assert.equal(b.rows[0].contract_value, 4167248.18);
+  /* BudgetRevenue, which is MYOB's REVISED contract value — variations already in. It is NOT
+     BudgetRevenue + ContractVariations (that was 4,167,248.18 here, and double-counted), and it is
+     NOT ContractValueIncVar, whose column sums to 1,381,094.70 and would look plausible on a card.
+     See the note in myobJobAnalysis.js for what proved it. */
+  assert.equal(b.rows[0].contract_value, 4011186.35);
   assert.equal(b.rows[0].budget_cost, 2786153.48);
   assert.equal(b.rows[0].project_id, "3817", "trimmed");
   assert.equal(b.rows[0].package_scope, "Recladding", "Type R mapped to the hub's vocabulary");

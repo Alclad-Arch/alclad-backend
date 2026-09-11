@@ -167,10 +167,38 @@ export function rollUpJobAnalysis(rows = []) {
      from the ledger by a few cents per hundred lines. */
   return [...by.values()].map((v) => {
     const o = { ...v };
-    /* THE CONTRACT VALUE, derived. Original contract plus approved variations, which is how MYOB's
-       own screen states it (Original Contract Value + Revised Variation Value = Revised Contract
-       Value). Verified on 6931: 69,110 + 0 = 69,110. */
-    o.contract_value = o.budget_revenue + o.contract_variations;
+    /* THE CONTRACT VALUE IS BudgetRevenue, FULL STOP — it ALREADY INCLUDES THE VARIATIONS.
+     *
+     * This used to add contract_variations on top, on the reasoning that MYOB's screen states
+     * Original Contract + Revised Variation = Revised Contract. That reasoning was right about the
+     * screen and wrong about the field: BudgetRevenue is the REVISED contract, not the original.
+     *
+     * How the old version survived: it was "verified on 6931 — 69,110 + 0 = 69,110", a job with NO
+     * variations, where both formulas give the same answer. And the 3817 check compared our sum
+     * against MYOB's ContractValueIncVar, whose formula is BudgetGP + ContractVariations — and on
+     * an income row cost is zero, so BudgetGP IS BudgetRevenue. That check was circular: it proved
+     * our arithmetic matched MYOB's identical arithmetic. Neither test could ever have failed.
+     *
+     * What settled it (Jed, 2026-09-11), against MYOB's own screens rather than another derived
+     * field:
+     *   6157 ESR Lot 4 — Revenue Budget tab: base 208,730.00 + change orders 5,861.67
+     *                    = 214,591.67 = BudgetRevenue exactly.
+     *                    Its ContractVariations read −14,823.01 — not the change orders at all.
+     *   5477 Fishermans Bend — Project Balances TOTALS: Original 2,350,000.00 + Revised Variation
+     *                    2,460,337.21 = Revised Contract Value 4,810,337.21 = the sum of
+     *                    BudgetRevenue across its two package rows, and it reconciles PER PACKAGE
+     *                    (Glazing 3,063,672.55) too.
+     *
+     * Across the portfolio: BudgetRevenue reconciled with MYOB's forecast on 119 of 119 rows; the
+     * old contract_value on 61 — precisely the 61 with no variations figure. The other 58 carried
+     * $2,242,176.13 of contract value that does not exist.
+     *
+     * ⚠ We still READ ContractVariations, and it is still stored — but nothing computes from it,
+     * because we do not know what it is. On 6157 it was −14,823.01 against real change orders of
+     * +5,861.67, and on 3817 it read 511,540.31 when probed and 156,061.83 once synced. A number
+     * that moves like that is not a variation total. Storing it keeps it checkable; using it was
+     * the mistake. */
+    o.contract_value = o.budget_revenue;
     for (const f of BUDGET_NUMERIC) o[f] = Math.round(o[f] * 100) / 100;
     return o;
   });
