@@ -593,8 +593,17 @@ app.get("/api/salesforce/service-status", requireSession, async (req, res) => {
     } catch { /* the token is the point; the identity is a nicety */ }
     const { data } = await supabaseAdmin.from("integration_tokens")
       .select("rotated_count, updated_at").eq("provider", SF_SVC_PROVIDER).maybeSingle();
+    /* seeded is read from the row AFTER the refresh, not from `stored` above.
+       `stored` was captured BEFORE serviceToken() ran — and serviceToken() is what writes the
+       row. So on the one run that matters most, a re-issue, the old code reported "nothing is
+       stored yet, the grant dies the next time Salesforce rotates it" while sitting directly
+       beside a rotation count and a write time read from the row it had just created. Jed saw
+       exactly that on 2026-09-11, seconds after the re-issue finally worked.
+       Reading it from `data` makes all three fields answer the same question at the same
+       moment: is there a row NOW. That also keeps the warning honest in the case it exists for —
+       a persist that genuinely failed leaves no row, and it still fires. */
     return res.json({ configured: true, ok: true, identity: who, instance: tok.instance_url,
-      seeded: stored.seeded,
+      seeded: !data,
       rotations: (data && data.rotated_count) || 0,
       lastRotated: (data && data.updated_at) || null,
       detail: "The service account can obtain a token, so every user should be able to read opportunity summaries. If one cannot, the failure is on the query rather than the connection." });
