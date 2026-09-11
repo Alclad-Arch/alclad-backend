@@ -92,6 +92,25 @@ const SUM_FIELDS = {
   PendingInvoiceAmt: 'pending_invoice',
   DraftInvoicedAmt: 'draft_invoiced',
   ForecastGP: 'forecast_gp',
+  /* ⚠ CostAtCompletion and ForecastGP CAN DISAGREE WITH MYOB'S PROJECTS SCREEN, and it is the
+     inquiry that is odd, not us. Both are stored exactly as returned — verified on the wire, as
+     numbers, not strings (probe-jobanalysis.js, 2026-09-11).
+
+     The identity always holds: CostAtCompletion = CostsToDate + CostProjection + OpenCommittedAmt.
+     The screen instead uses CostsToDate + its own "Costs to Complete", and the two part company on
+     a job that has OVERSPENT its cost estimate, because the inquiry floors CostProjection at 0
+     where the screen lets Costs to Complete go negative:
+
+       6163 (budget remaining)  CostProjection 60,543.09 / 73,394.81 → agrees to the cent
+       5477 (overspent)         CostProjection 0.00 on both rows, screen implies
+                                −1,668.78 (G) and −35,190.85 (C)
+
+     ForecastGP inherits it exactly, being contract less CostAtCompletion — so on an overspent job
+     our forecast GP reads LOW by the same amount the cost reads high. Conservative, and wrong.
+
+     NOT FIXABLE HERE: "Costs to Complete" is not a column this inquiry returns. Matching the
+     screen needs ALX_JobAnalysis itself extended, which is a MYOB-side change. Inventing the
+     figure from what we do have would be a guess wearing MYOB's name. */
   CostAtCompletion: 'cost_at_completion',
   CostProjection: 'cost_projection',
   OpenCommittedAmt: 'open_committed',
@@ -193,11 +212,19 @@ export function rollUpJobAnalysis(rows = []) {
      * old contract_value on 61 — precisely the 61 with no variations figure. The other 58 carried
      * $2,242,176.13 of contract value that does not exist.
      *
-     * ⚠ We still READ ContractVariations, and it is still stored — but nothing computes from it,
-     * because we do not know what it is. On 6157 it was −14,823.01 against real change orders of
-     * +5,861.67, and on 3817 it read 511,540.31 when probed and 156,061.83 once synced. A number
-     * that moves like that is not a variation total. Storing it keeps it checkable; using it was
-     * the mistake. */
+     * ⚠ ContractVariations IS THE GROSS PROFIT ON THE VARIATIONS, NOT THEIR VALUE. Named wrongly
+     * by any ordinary reading, which is exactly how it ended up added to a contract. Proved by
+     * probing the inquiry for two jobs and matching the VARIATIONS block of MYOB's Project
+     * Balances screen (2026-09-11):
+     *
+     *   5477  G 445,981.05 + C 720,675.16 = 1,166,656.21 = screen VARIATIONS GP $
+     *         (Revised Variation Value 2,460,337.21 − Revised Variation Cost 1,293,681.00)
+     *   6163  G   7,759.50 + C  88,296.00 =    96,055.50 = screen VARIATIONS GP $
+     *
+     * So it is a margin, and adding a margin to a revenue figure is meaningless — which also
+     * explains 6157's −14,823.01 (variations that LOST money there) and why 3817's value appeared
+     * to move. It is still read and stored because it is a real figure worth having; nothing
+     * computes from it, and nothing should without deciding what question it answers. */
     o.contract_value = o.budget_revenue;
     for (const f of BUDGET_NUMERIC) o[f] = Math.round(o[f] * 100) / 100;
     return o;
