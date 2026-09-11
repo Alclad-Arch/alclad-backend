@@ -29,6 +29,7 @@ import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
 import { loadKey, isSealed, seal as sealWith, unseal as unsealWith } from "./tokenCrypto.js";
 import { buildSummaryQuery, shapeSummary } from "./oppSummary.js";
+import { buildSearchQuery } from "./oppSearch.js";
 import { syncActuals } from "./syncMyobActuals.js";
 import { schedulerEnabled, startupJitterMs, CHECK_MS } from "./syncSchedule.js";
 
@@ -679,6 +680,92 @@ app.get("/api/salesforce/opportunity-summary", requireSession, rateLimit({ perMi
     console.error("opportunity-summary error:", e && e.name, e && e.message);
     audit(req, "opp_summary_error", `${id} — ${e && e.name}`, 502);
     res.status(502).json({ error: "Salesforce request failed" });
+  }
+});
+
+// Opportunity type-ahead for the "New estimating project" picker.
+//
+// Jed 2026-09-11: "would be nice if users could connect to opportunities via the service
+// account ... mine doesn't stay logged in all the time and i have to relogin." An estimating
+// project cannot be created without an opportunity, so a lapsed personal Salesforce grant
+// blocks the work entirely — the picker degrades to a plain text box and the link is lost.
+//
+// Three things make this safe to back with the shared service identity:
+//
+//   1. requireUser, NOT requireSession. This is the one place the difference matters. The
+//      summary endpoint is deliberately open to any session, because it only ever returns
+//      figures for an opportunity a budget is ALREADY linked to. Search is different: it
+//      enumerates opportunities. So it takes the same role gate as the rest of Salesforce
+//      (SF_ALLOWED_ROLES), which is Jed's "only the right people who can add projects".
+//   2. The SOQL is built here from a search term, never accepted from the caller — see
+//      oppSearch.js. The generic proxy below would have handed arbitrary SOQL to the
+//      service identity, which is exactly what we are not doing.
+//   3. The caller's own connection is still tried FIRST, so anyone who has connected keeps
+//      their own field-level security. The service account is the fallback, not the default.
+//
+// ⚠ When it DOES fall back, everyone sees what the service identity sees. For opportunity
+//    names in a picker that is the intent; it is worth knowing before adding fields here.
+app.get("/api/salesforce/opportunity-search", requireUser, rateLimit({ perMin: RATE_PER_MIN, perDay: RATE_PER_DAY, action: "opp_search" }), async (req, res) => {
+  const q = buildSearchQuery(req.query.q, String(req.query.numberField || "").trim());
+  // Not an error: the picker calls on every keystroke and a one-character term is normal.
+  if (!q) return res.json({ records: [], viaService: false, tooShort: true });
+
+  let viaService = false;
+  const { data: raw } = await supabaseAdmin.from("salesforce_tokens").select("*").eq("user_id", req.userId).maybeSingle();
+  const row = raw ? openRow(raw, req.userId) : null;
+  let token = row ? row.access_token : null;
+  let instance = row ? row.instance_url : null;
+
+  const call = (soql, tk, inst) => fetch(
+    `${inst}/services/data/v60.0/query?q=${encodeURIComponent(soql)}`,
+    { method: "GET", headers: { Authorization: `Bearer ${tk}`, "Content-Type": "application/json" },
+      signal: AbortSignal.timeout(SF_TIMEOUT_MS) });
+
+  try {
+    // Establish WHICH credentials answer, using the first (richest) query as the probe.
+    let r = token ? await call(q.soqls[0], token, instance) : null;
+    if (r && r.status === 401) {
+      const refreshed = await refreshSalesforce(req.userId, row);
+      r = refreshed ? await call(q.soqls[0], refreshed.access_token, refreshed.instance_url) : null;
+      if (refreshed) { token = refreshed.access_token; instance = refreshed.instance_url; }
+    }
+    /* 400 is a FIELD problem, not a credentials problem — the identity is fine and the
+       column is not. Falling back to the service account on a 400 would mask a mapping
+       mistake as a connection one, and the retries below are what actually fix it. */
+    if (!r || (!r.ok && r.status !== 400)) {
+      const svc = await serviceToken(false);
+      if (!svc) {
+        audit(req, "opp_search_unavailable", q.term, 503);
+        return res.status(503).json({ error: "No Salesforce connection available for this search" });
+      }
+      viaService = true;
+      token = svc.access_token; instance = svc.instance_url;
+      r = await call(q.soqls[0], token, instance);
+      if (r.status === 401) {                        // cached service token stale — force one refresh
+        const fresh = await serviceToken(true);
+        if (!fresh) return res.status(503).json({ error: "Salesforce service account unavailable" });
+        token = fresh.access_token; instance = fresh.instance_url;
+        r = await call(q.soqls[0], token, instance);
+      }
+    }
+    // Now drop fields until it answers — one unreadable column fails the whole SOQL.
+    for (let i = 1; i < q.soqls.length && !r.ok && r.status === 400; i++) {
+      r = await call(q.soqls[i], token, instance);
+    }
+    if (!r.ok) {
+      const msg = await r.text();
+      console.warn("opportunity-search upstream:", r.status, msg.slice(0, 300));
+      audit(req, "opp_search_failed", `${q.term} — ${r.status}`, r.status);
+      return res.status(502).json({ error: "Salesforce could not answer the search" });
+    }
+    const data = await r.json();
+    const records = Array.isArray(data.records) ? data.records : [];
+    audit(req, "opp_search", `${q.term} — ${records.length}${viaService ? " (service)" : ""}`, 200);
+    res.json({ records, viaService });
+  } catch (e) {
+    console.error("opportunity-search error:", e && e.name, e && e.message);
+    audit(req, "opp_search_error", `${q.term} — ${e && e.name}`, 502);
+    res.status(502).json({ error: "Salesforce search failed" });
   }
 });
 
