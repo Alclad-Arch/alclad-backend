@@ -30,6 +30,7 @@ import { createClient } from "@supabase/supabase-js";
 import { loadKey, isSealed, seal as sealWith, unseal as unsealWith } from "./tokenCrypto.js";
 import { buildSummaryQuery, shapeSummary } from "./oppSummary.js";
 import { buildSearchQuery } from "./oppSearch.js";
+import { serialQueue } from "./serialQueue.js";
 import { syncActuals } from "./syncMyobActuals.js";
 import { schedulerEnabled, startupJitterMs, CHECK_MS } from "./syncSchedule.js";
 
@@ -512,8 +513,43 @@ async function sfServiceStore(refresh, rotations, instance, note) {
     "— the grant will need re-issuing after the next restart");
 }
 
+/* ⚠ EVERY REFRESH GOES THROUGH THIS CHAIN, ONE AT A TIME. WITH ROTATION ENFORCED, TWO CONCURRENT
+ * REFRESHES CAN KILL THE GRANT.
+ *
+ * What used to happen: the cache check is synchronous but the work after it is not — a database
+ * read, then a round trip to Salesforce. For those few hundred milliseconds svcTok is still stale,
+ * so EVERY concurrent request saw a miss and started its own refresh. Salesforce rotates the
+ * refresh token on use and invalidates the old one, so request A got T1 (killing T) while request
+ * B was still in flight holding T. B then either failed outright or was issued T2, killing T1 —
+ * and whichever sfServiceStore() resolved LAST wrote its token over the other's. Store a token
+ * Salesforce has already invalidated and the next refresh is invalid_grant: the grant is gone, and
+ * nothing in the logs says why, because every individual step succeeded.
+ *
+ * That is what happened on 2026-09-14, five rotations after a healthy re-issue. It was not the
+ * persistence failure the health panel warns about — persistence worked every time. It was two
+ * refreshes at once, and it became likely when opportunity-search was added on 2026-09-11: a third
+ * caller, firing from the picker as someone types, against a free Render instance that sleeps and
+ * then wakes to several requests at once with an empty cache.
+ *
+ * A plain in-flight promise would serialise it, but a forced refresh (a cached access token that
+ * 401'd) would then join a refresh that may have STARTED before that 401 and hand back the same
+ * dead token. Chaining instead means a forced refresh waits its turn and then genuinely refreshes.
+ * The cache is re-checked INSIDE the chain so callers that piled up behind one refresh take its
+ * result instead of each starting another. */
+const svcQueue = serialQueue();
+const svcFresh = () => svcTok && Date.now() - svcTok.at < 30 * 60 * 1000;
+
 async function serviceToken(force) {
-  if (!force && svcTok && Date.now() - svcTok.at < 30 * 60 * 1000) return svcTok;
+  if (!force && svcFresh()) return svcTok;
+  return svcQueue(() => {
+    /* Re-checked INSIDE the queue: callers that piled up behind one refresh take its result
+       instead of each starting another. A forced refresh skips this and does its own. */
+    if (!force && svcFresh()) return svcTok;
+    return refreshServiceToken();
+  });
+}
+
+async function refreshServiceToken() {
   const held = await sfServiceRefreshToken();
   if (!held) return null;
   const body = new URLSearchParams({
