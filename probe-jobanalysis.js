@@ -27,6 +27,13 @@ import { readOdataCreds, describeCreds } from "./myobOdataCreds.js";
 import { readInquiry } from "./myobOdataRead.js";
 import { BUDGET_SELECT, BUDGET_INQUIRY } from "./myobJobAnalysis.js";
 
+/* --all drops the $select so the inquiry returns EVERY column it has, not just the ones we ask
+   for. Added 2026-09-14 for a specific question — Jed: "I think this figure should be the GP% on
+   which the project was won. Is that a stored figure in myob per project?" MYOB's Project Balances
+   screen shows it (ORIGINAL CONTRACT → GP %), but everything in BUDGET_SELECT is the REVISED side,
+   so whether the original is reachable through this inquiry is not something reading our own code
+   can answer. */
+const all = process.argv.includes("--all");
 const jobs = process.argv.slice(2).filter((a) => !a.startsWith("--"));
 if (!jobs.length) {
   console.error("\nGive it at least one job number:  node probe-jobanalysis.js 5477 6163\n");
@@ -57,14 +64,15 @@ console.log(`  jobs             : ${jobs.join(", ")}\n`);
    are what the Acumatica licence counts. */
 const filter = jobs.map((j) => `Project eq '${String(j).replace(/'/g, "''")}'`).join(" or ");
 const { rows, complete } = await readInquiry({
-  ...creds, inquiry: BUDGET_INQUIRY, select: BUDGET_SELECT, filter, orderBy: "Project",
+  ...creds, inquiry: BUDGET_INQUIRY, filter, orderBy: "Project",
+  ...(all ? {} : { select: BUDGET_SELECT }),
 });
 if (!complete) console.warn("⚠ the read reported incomplete — treat what follows as partial\n");
 console.log(`${rows.length} row(s)\n`);
 
 for (const r of rows) {
   console.log("─".repeat(78));
-  for (const f of BUDGET_SELECT) {
+  for (const f of (all ? Object.keys(r) : BUDGET_SELECT)) {
     const v = r[f];
     const t = v === null ? "null" : v === undefined ? "ABSENT" : typeof v;
     /* JSON.stringify so a string is visibly quoted: "0.00" and 0 print identically otherwise, and
