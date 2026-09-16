@@ -22,12 +22,19 @@ import { readOdataCreds } from "./myobOdataCreds.js";
 import {
   rollUpJobAnalysis, BUDGET_INQUIRY, BUDGET_SELECT, BUDGET_ORDER, BUDGET_NUMERIC,
 } from "./myobJobAnalysis.js";
+import {
+  rollUpCostCodes, reconcileAgainstPackages,
+  COSTCODE_INQUIRY, COSTCODE_SELECT, COSTCODE_ORDER, COSTCODE_NUMERIC,
+} from "./myobCostCodes.js";
 import { shouldRunNow } from "./syncSchedule.js";
 
 export const TABLE = "myob_actuals";
 /* The contract-and-budget half, from ALX_JobAnalysis. Written in the SAME run as the ledger so both
    reads share one Acumatica session — sessions, not requests, are what the licence counts. */
 export const BUDGET_TABLE = "myob_project_budget";
+/* The same money broken down to the cost code, from ALX_JobAnalysis_Detail — what the hub's
+   cost-code bars read. Fourth read, same session, for the same licence reason. */
+export const COSTCODE_TABLE = "myob_cost_budget";
 export const CHUNK = 500;
 
 /* When did the last successful sync finish? max(synced_at) — every run stamps every row it writes,
@@ -183,6 +190,51 @@ export async function syncActuals(db, {
     synced_at: syncedAt,
   }));
 
+  /* ── THE COST-CODE READ ───────────────────────────────────────────────────────────────────────
+   *
+   * Fourth read, same session. ALX_JobAnalysis_Detail is the `_Detail` sibling of the inquiry read
+   * just above — the identical money, broken down to project × task × account group × cost code.
+   *
+   * ⚠ IT IS SUBSTANTIALLY BIGGER than the package inquiry (thousands of rows, not ~171), so it
+   * pages. That is exactly why COSTCODE_ORDER exists: an unordered $skip page can repeat one row
+   * and drop another, and the total then comes up quietly short.
+   *
+   * rollUpCostCodes THROWS if the inquiry's two cost-code columns ever disagree. That is
+   * deliberate and it is not a network failure: it means the inquiry's join has changed underneath
+   * us and a whole package's budget would otherwise land on one arbitrary code, looking entirely
+   * plausible on screen. Better a loud nightly failure than a wrong bar. */
+  const codeRead = await read({
+    instance: creds.instance, tenant: creds.tenant, inquiry: COSTCODE_INQUIRY,
+    user: creds.user, pass: creds.pass, select: COSTCODE_SELECT, orderBy: COSTCODE_ORDER,
+    cookie: groupRead.cookie,
+  });
+  const codeRolled = rollUpCostCodes(codeRead.rows);
+  const codeTableRows = codeRolled.map((r) => ({
+    project_id: r.project_id,
+    package_type: r.package_type,
+    cost_code: r.cost_code,
+    cost_code_dashed: r.cost_code_dashed,
+    cost_code_desc: r.cost_code_desc,
+    account_group: r.account_group,
+    project_task: r.project_task,
+    is_defect: r.is_defect,
+    ...Object.fromEntries(COSTCODE_NUMERIC.map((f) => [f, r[f]])),
+    has_budget: r.has_budget,
+    has_forecast: r.has_forecast,
+    source_rows: r.source_rows,
+    synced_at: syncedAt,
+  }));
+
+  /* ⚠ THE CHECK THAT MAKES THE BARS TRUSTWORTHY, run on the two reads this run just did rather
+     than against any stored constant. Per-code figures MUST sum to what the package inquiry reports
+     for the same job, or bars would contradict the dials directly above them on the same screen
+     and neither would say so.
+     REPORTED, NOT ENFORCED — see the overspent-job note in myobCostCodes.js: ALX_JobAnalysis floors
+     CostProjection at 0 where the _Detail inquiry does not, so an overspent job MAY legitimately
+     drift, and that would be the detail feed being more faithful rather than wrong. Refusing on it
+     would stop the nightly run over a known MYOB quirk; hiding it would be worse. */
+  const codeRecon = reconcileAgainstPackages(codeRolled, budgetRolled);
+
   let written = 0;
   for (const part of chunk(tableRows)) {
     const { error } = await db.from(TABLE).upsert(part, { onConflict: "project_id,cost_code,fin_period" });
@@ -209,6 +261,21 @@ export async function syncActuals(db, {
     budgetWritten += part.length;
   }
 
+  /* The cost-code table, written after the package table for the same reason that one is written
+     after the ledger: a failure here leaves the coarser figures intact and correct rather than the
+     set half-updated in an unknown combination. The hub degrades to package-level dials, which is
+     exactly what it showed before these bars existed. */
+  let codeWritten = 0;
+  for (const part of chunk(codeTableRows)) {
+    const { error } = await db.from(COSTCODE_TABLE).upsert(part, { onConflict: "project_id,package_type,cost_code" });
+    if (error) {
+      const e = new Error(`${COSTCODE_TABLE} upsert failed after ${codeWritten} row(s): ${error.message}`);
+      e.written = codeWritten;
+      throw e;
+    }
+    codeWritten += part.length;
+  }
+
   let budgetSwept = 0;
   /* Judged on its OWN read and its OWN write count. Gating the budget sweep on the ledger's success
      would delete a project's contract because its transactions failed to read, and vice versa —
@@ -217,6 +284,16 @@ export async function syncActuals(db, {
     const { data, error } = await db.from(BUDGET_TABLE).delete().lt("synced_at", syncedAt).select("project_id");
     if (error) throw new Error(`${BUDGET_TABLE} sweep failed: ${error.message}`);
     budgetSwept = Array.isArray(data) ? data.length : 0;
+  }
+
+  let codeSwept = 0;
+  /* Its own read, its own write count — a third independent decision. This feed pages, so a
+     truncated read is a live possibility here in a way it is not for the ~171-row package inquiry,
+     and sweeping after one would delete every code the read never reached. */
+  if (shouldSweep({ complete: codeRead.complete === true, rowsWritten: codeWritten })) {
+    const { data, error } = await db.from(COSTCODE_TABLE).delete().lt("synced_at", syncedAt).select("project_id");
+    if (error) throw new Error(`${COSTCODE_TABLE} sweep failed: ${error.message}`);
+    codeSwept = Array.isArray(data) ? data.length : 0;
   }
 
   let swept = 0;
@@ -236,7 +313,7 @@ export async function syncActuals(db, {
     rolled: rolled.length,
     written,
     swept,
-    requests: requests + groupRead.requests + budgetRead.requests,
+    requests: requests + groupRead.requests + budgetRead.requests + codeRead.requests,
     sessionReused,
     complete: complete === true,
     /* Said out loud in the report, because "which groups counted as cost" is the question behind
@@ -251,6 +328,23 @@ export async function syncActuals(db, {
     budgetComplete: budgetRead.complete === true,
     withContractValue: budgetRolled.filter((r) => r.contract_value !== 0).length,
     withCostBudget: budgetRolled.filter((r) => r.budget_cost !== 0).length,
+    /* The cost-code half, reported separately again — three feeds, three sets of numbers, so one
+       that read nothing cannot hide behind another that worked. */
+    codeRead: codeRead.rows.length,
+    codeRolled: codeRolled.length,
+    codeWritten,
+    codeSwept,
+    codeComplete: codeRead.complete === true,
+    codesWithBudget: codeRolled.filter((r) => r.has_budget).length,
+    codesWithForecast: codeRolled.filter((r) => r.has_forecast).length,
+    codeDefects: codeRolled.filter((r) => r.is_defect).length,
+    /* ⚠ SAID OUT LOUD EVERY RUN. A silent reconciliation is one nobody reads until the bars are
+       already wrong; the drift list is capped so a systemic break reports its scale rather than
+       printing thousands of lines. */
+    codeReconciles: codeRecon.ok,
+    codeDrifts: codeRecon.drifts.slice(0, 20),
+    codeDriftCount: codeRecon.drifts.length,
+    codeUnmatched: codeRecon.unmatched.length,
     syncedAt,
     as: creds.user,
     /* Named so a summary can say it out loud: the whole point of the roll-up is that these two

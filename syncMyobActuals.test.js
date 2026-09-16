@@ -9,8 +9,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { syncActuals, chunk, shouldSweep, toTableRows, TABLE } from "./syncMyobActuals.js";
-import { GROUPS_INQUIRY } from "./myobOdataRead.js";
+import { GROUPS_INQUIRY, ACTUALS_INQUIRY } from "./myobOdataRead.js";
 import { BUDGET_INQUIRY } from "./myobJobAnalysis.js";
+import { COSTCODE_INQUIRY } from "./myobCostCodes.js";
 
 const CREDS = {
   instance: "https://alcladarchitectural.myobadvanced.com",
@@ -173,12 +174,16 @@ test("the read is asked for the actuals inquiry, with only the columns stored", 
   await syncActuals(fakeDb(), {
     creds: CREDS,
     read: async (args) => {
+      /* The classification read still has to answer with real groups — without Expense groups the
+         sync refuses before it reads anything else, which is the guard working, not a failure. */
       if (args.inquiry === GROUPS_INQUIRY) return { rows: GROUPS, requests: 1, complete: true, cookie: "c" };
-      if (args.inquiry === BUDGET_INQUIRY) return { rows: [], requests: 1, complete: true };
-      /* Captured ONLY for the ledger read — a third inquiry was added later and overwrote this,
-         so the assertions below silently described the wrong call. */
-      asked = args;
-      return { rows: [], requests: 1, complete: true };
+      /* ⚠ CAPTURED BY MATCHING THE LEDGER INQUIRY, NOT BY FALLING THROUGH TO IT. This used to be a
+         chain of "if it isn't the others, it's this one", and it broke TWICE for the same reason:
+         a third inquiry was added and overwrote the capture, then a fourth (ALX_JobAnalysis_Detail)
+         did it again. Matching positively means the next inquiry added cannot silently make these
+         assertions describe the wrong call. */
+      if (args.inquiry === ACTUALS_INQUIRY) asked = args;
+      return { rows: [], requests: 1, complete: true, cookie: args.cookie || "c" };
     },
   });
   /* ALX_JobTrans, not PMHistoryByDateMaster. The dry run proved PMHistory's ProjectID is an
@@ -288,9 +293,9 @@ test("a BLANK account group refuses too, rather than vanishing", async () => {
     /\(blank\)/);
 });
 
-test("all THREE reads share ONE session", async () => {
-  /* Sessions, not requests, are what the Acumatica licence counts — so adding a third inquiry must
-     not add a third session. */
+test("all FOUR reads share ONE session", async () => {
+  /* Sessions, not requests, are what the Acumatica licence counts — so adding an inquiry must never
+     add a session. Was three; ALX_JobAnalysis_Detail made it four, and it reuses the same cookie. */
   const seen = [];
   await syncActuals(fakeDb(), {
     creds: CREDS,
@@ -300,7 +305,10 @@ test("all THREE reads share ONE session", async () => {
       return { rows: [], requests: 1, complete: true, cookie: args.cookie };
     },
   });
-  assert.equal(seen.length, 3, seen.map((x) => x.inquiry).join(", "));
+  assert.equal(seen.length, 4, seen.map((x) => x.inquiry).join(", "));
+  assert.deepEqual(seen.map((x) => x.inquiry).slice(1).sort(),
+    [ACTUALS_INQUIRY, BUDGET_INQUIRY, COSTCODE_INQUIRY].sort(),
+    "the three data reads, by name — a renamed inquiry must fail here, not at 1am");
   assert.equal(seen[0].inquiry, GROUPS_INQUIRY, "classification first — without it nothing is safe to store");
   for (const r of seen.slice(1)) {
     assert.equal(r.cookie, "SESS=1", `${r.inquiry} opened its own session instead of reusing`);
