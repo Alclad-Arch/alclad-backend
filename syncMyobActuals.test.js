@@ -190,8 +190,16 @@ test("the read is asked for the actuals inquiry, with only the columns stored", 
   /* ALX_JobTrans, not PMHistoryByDateMaster. The dry run proved PMHistory's ProjectID is an
      internal integer that joins to no hub project, and that its rows mix income with cost. */
   assert.equal(asked.inquiry, "ALX_JobTrans");
-  assert.deepEqual(asked.select,
-    ["Project", "ProjectName", "CostCode", "AccountGroup", "CostCodeGrp", "FinPeriod", "Amount", "Qty", "TranID"]);
+  /* The columns the roll-up sums. ⚠ No longer an exact list: this one read now feeds TWO tables —
+     myob_actuals summarised, myob_ledger_line one-for-one — so the select carries the drill-down's
+     columns too. What must never change is that these nine are asked for. */
+  for (const c of ["Project", "ProjectName", "CostCode", "AccountGroup", "CostCodeGrp",
+                   "FinPeriod", "Amount", "Qty", "TranID"]) {
+    assert.ok(asked.select.includes(c), c);
+  }
+  /* ⚠ AND THAT IT IS STILL ONE READ. The drill-down was added by widening this select rather than
+     by adding a sixth inquiry, which is the whole reason it costs no extra Acumatica session. */
+  assert.ok(asked.select.includes("SupplierInvNbr"), "the drill-down rides on this same read");
   assert.equal(asked.orderBy, "TranID", "paging $skip without an order can drop rows");
   assert.equal(asked.tenant, CREDS.tenant);
 });

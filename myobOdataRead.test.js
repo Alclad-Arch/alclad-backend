@@ -154,9 +154,21 @@ test("missing credentials is refused before any request is made", async () => {
 });
 
 // ── the roll-up ───────────────────────────────────────────────────────────
-test("the actuals select asks for exactly the columns stored", () => {
-  assert.deepEqual(ACTUALS_SELECT,
-    ["Project", "ProjectName", "CostCode", "AccountGroup", "CostCodeGrp", "FinPeriod", "Amount", "Qty", "TranID"]);
+test("the actuals select still asks for everything the roll-up sums", () => {
+  /* ⚠ THIS USED TO ASSERT AN EXACT LIST OF NINE, on the reasoning that the read fed one table. It
+     now feeds TWO from the same rows — myob_actuals (summarised) and myob_ledger_line (one-for-one)
+     — so an exact list would churn every time the drill-down learns a new field, and would say
+     nothing about the thing that matters. What matters is that the nine rollUpActuals depends on
+     are never dropped: losing one would leave the figures silently short. */
+  for (const c of ["Project", "ProjectName", "CostCode", "AccountGroup", "CostCodeGrp",
+                   "FinPeriod", "Amount", "Qty", "TranID"]) {
+    assert.ok(ACTUALS_SELECT.includes(c), c);
+  }
+  /* And that it has not quietly become "select everything", which is how a read gets slow and how
+     a column nobody chose ends up stored. The drill-down's columns are listed in
+     myobLedgerLines.test.js, which is where their meaning is documented. */
+  assert.ok(ACTUALS_SELECT.length <= 30, `${ACTUALS_SELECT.length} columns`);
+  assert.equal(new Set(ACTUALS_SELECT).size, ACTUALS_SELECT.length, "no duplicates");
 });
 
 test("per-transaction rows sum to one row per project, cost code and period", () => {

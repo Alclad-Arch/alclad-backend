@@ -29,6 +29,7 @@ import {
 import {
   rollUpProjections, PROJECTION_INQUIRY, PROJECTION_SELECT, PROJECTION_ORDER,
 } from "./myobCostProjections.js";
+import { toLedgerLines } from "./myobLedgerLines.js";
 import { shouldRunNow } from "./syncSchedule.js";
 
 export const TABLE = "myob_actuals";
@@ -41,6 +42,9 @@ export const COSTCODE_TABLE = "myob_cost_budget";
 /* Forecast HISTORY per cost code. The biggest of these tables by row count — every revision of
    every code of every job — and it only grows, so nothing loads it whole. */
 export const PROJECTION_TABLE = "myob_cost_projection";
+/* The ledger at TRANSACTION grain — the drill-down behind a cost-code bar. Built from the SAME read
+   as myob_actuals, so it costs no extra request and no extra session. */
+export const LEDGER_TABLE = "myob_ledger_line";
 export const CHUNK = 500;
 
 /* When did the last successful sync finish? max(synced_at) — every run stamps every row it writes,
@@ -164,6 +168,12 @@ export async function syncActuals(db, {
 
   const rolled = rollUpActuals(rows, { costGroups, incomeGroups: income });
   const tableRows = toTableRows(rolled, syncedAt);
+  /* ⚠ THE SAME ROWS, KEPT ONE-FOR-ONE. rollUpActuals summarises them to project × code × period;
+     this keeps every transaction so a red bar can be opened. Both from one read — the drill-down
+     costs nothing but the columns already in ACTUALS_SELECT.
+     toLedgerLines REFUSES on a duplicate TranID, which would mean paging repeated a row — and that
+     would have double-counted the figures above it too, silently. */
+  const ledgerLines = toLedgerLines(rows, syncedAt);
 
   /* ── THE CONTRACT AND BUDGET READ ─────────────────────────────────────────────────────────────
    *
@@ -376,6 +386,28 @@ export async function syncActuals(db, {
     codeSwept = Array.isArray(data) ? data.length : 0;
   }
 
+  /* The transaction detail. Written after the figures it explains, so a failure here costs the
+     drill-down and leaves every total intact. */
+  let ledgerWritten = 0;
+  for (const part of chunk(ledgerLines)) {
+    const { error } = await db.from(LEDGER_TABLE).upsert(part, { onConflict: "project_id,tran_id" });
+    if (error) {
+      const e = new Error(`${LEDGER_TABLE} upsert failed after ${ledgerWritten} row(s): ${error.message}`);
+      e.written = ledgerWritten;
+      throw e;
+    }
+    ledgerWritten += part.length;
+  }
+
+  let ledgerSwept = 0;
+  /* Judged on THE LEDGER READ — the same read myob_actuals is judged on, because they are the same
+     rows. A transaction reversed or re-coded in MYOB has to disappear from both. */
+  if (shouldSweep({ complete: complete === true, rowsWritten: ledgerWritten })) {
+    const { data, error } = await db.from(LEDGER_TABLE).delete().lt("synced_at", syncedAt).select("project_id");
+    if (error) throw new Error(`${LEDGER_TABLE} sweep failed: ${error.message}`);
+    ledgerSwept = Array.isArray(data) ? data.length : 0;
+  }
+
   let projSwept = 0;
   /* Its own read, its own count — the fifth independent decision. This feed pages the most of the
      five, so a truncated read is likeliest here, and sweeping after one would delete the history of
@@ -448,6 +480,13 @@ export async function syncActuals(db, {
        proved what these columns MEAN, so it is checked every run rather than trusted once. */
     projAgrees: projDrifts.length === 0,
     projDrifts,
+    /* The transaction detail — fifth set of numbers, reported separately like the rest. The counts
+       by source are the useful part: they say how much of the ledger can be traced to a supplier
+       invoice at all, which is the honest limit of the drill-down. */
+    ledgerWritten,
+    ledgerSwept,
+    ledgerBySource: ledgerLines.reduce((acc, l) => { acc[l.source] = (acc[l.source] || 0) + 1; return acc; }, {}),
+    ledgerWithInvoice: ledgerLines.filter((l) => !!l.supplier_inv_nbr).length,
     /* How many package figures the reconciliation actually checked. Without it the report reads
        "matched on all package(s)" — which is equally true of having compared none. */
     compared: codeRecon.compared,

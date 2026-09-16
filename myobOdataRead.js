@@ -167,7 +167,22 @@ export const ACTUALS_INQUIRY = 'ALX_JobTrans';
    the lower number, so a link made on the number alone would silently omit a package's cost — a
    figure that looks entirely plausible and is short by a whole scope. With the name stored, sibling
    numbers can be spotted and linked deliberately. */
-export const ACTUALS_SELECT = ['Project', 'ProjectName', 'CostCode', 'AccountGroup', 'CostCodeGrp', 'FinPeriod', 'Amount', 'Qty', 'TranID'];
+/* ⚠ THE SECOND HALF OF THIS LIST FEEDS A DIFFERENT TABLE FROM THE SAME READ. myob_actuals rolls
+   53,793 ledger rows down to 5,753 figures; myob_ledger_line keeps them one-for-one so a red
+   cost-code bar can be opened and the transactions behind it read. Both are built from THIS read —
+   one inquiry, one session, no extra requests — so the columns live together here.
+   See myobLedgerLines.js for what each of them means and, more importantly, when each is null. */
+export const ACTUALS_SELECT = [
+  'Project', 'ProjectName', 'CostCode', 'AccountGroup', 'CostCodeGrp', 'FinPeriod', 'Amount', 'Qty', 'TranID',
+  // where it came from — this decides which of the rest are populated
+  'Module', 'Type', 'ReferenceNbr', 'Reference', 'SupplierInvNbr',
+  // who
+  'PreferredVendor', 'PreferredVendorName', 'Employee', 'EmployeeName',
+  // what
+  'InventoryItem', 'InventoryItemDescr', 'InventoryClass', 'Description',
+  // when and how much
+  'TranDate', 'Date', 'UnitRate', 'UOM',
+];
 /* Unique per transaction, so paging is deterministic — see the $orderby note in giUrl. */
 export const ACTUALS_ORDER = 'TranID';
 
