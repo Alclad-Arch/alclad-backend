@@ -24,6 +24,9 @@ import {
   rollUpCostCodes, reconcileAgainstPackages,
   COSTCODE_INQUIRY, COSTCODE_SELECT, COSTCODE_ORDER,
 } from "./myobCostCodes.js";
+import {
+  rollUpProjections, PROJECTION_INQUIRY, PROJECTION_SELECT, PROJECTION_ORDER,
+} from "./myobCostProjections.js";
 
 /* Whether the per-code figures sum to the per-package ones. Shared by the dry run and the real run
  * so the two cannot report it differently — the dry run exists precisely so this can be checked
@@ -34,6 +37,28 @@ import {
  * where it does, the DETAIL figure is the more faithful one. Which is why this prints the jobs
  * rather than failing the run: the list is the evidence for deciding that, and 5477 is the job to
  * look for. */
+/* Does each code's NEWEST revision still agree with its current forecast?
+ *
+ * That agreement is what PROVED what these columns mean — 6163/1000101's newest revision forecasts
+ * 12,477, exactly the cost_at_completion the per-code feed reports — so it is re-checked every run
+ * rather than trusted once. A divergence means one of the two inquiries changed meaning underneath
+ * us, which is the failure this whole feed has already suffered once.
+ *
+ * REPORTED, not enforced: a projection written before the latest budget change can legitimately
+ * differ, and refusing would stop the nightly over a bookkeeping order. */
+function reportProjectionAgreement(out) {
+  if (out.projAgrees) {
+    console.log(`  ✓ every code's newest revision matches its current cost at completion`);
+    return;
+  }
+  console.log(`  ⚠ ${out.projDrifts.length} code(s) whose newest revision does NOT match the current forecast:`);
+  for (const d of out.projDrifts) {
+    console.log(`      ${d.project_id} ${d.cost_code} ${String(d.revision).padEnd(14)} projection ${d.latest_projection.toFixed(2).padStart(13)}  current ${d.cost_at_completion.toFixed(2).padStart(13)}  diff ${d.diff.toFixed(2)}`);
+  }
+  console.log(`  A projection written before the latest budget change can differ legitimately.`);
+  console.log(`  Anything else means one of the two inquiries has changed meaning.`);
+}
+
 function reportReconciliation(out) {
   if (out.codeReconciles) {
     const n = out.compared == null ? '' : `${out.compared} `;
@@ -188,6 +213,20 @@ try {
         codeDriftCount: recon.drifts.length, compared: recon.compared, codeRolled: codeRolled.length,
       });
     }
+    /* The fifth read, on the same session again. A dry run that covered four of five reads is how
+       the silent-feed problem got past review in the first place. */
+    const projRead = await readInquiry({
+      instance: creds.instance, tenant: creds.tenant, inquiry: PROJECTION_INQUIRY,
+      user: creds.user, pass: creds.pass, select: PROJECTION_SELECT, orderBy: PROJECTION_ORDER,
+      cookie: groupRead.cookie,
+    });
+    const projRolled = rollUpProjections(projRead.rows);
+    const revisions = new Set(projRolled.map((r) => `${r.project_id}|${r.revision}`));
+    console.log(`\nforecast history from ${PROJECTION_INQUIRY}`);
+    console.log(`read ${projRead.rows.length} row(s)${projRead.complete ? "" : " — ⚠ INCOMPLETE, a real run would not sweep"}`);
+    console.log(`rolls up to ${projRolled.length} project × revision × code figure(s) across ${revisions.size} revision(s)`);
+    console.log(`  pre-budget rows : ${projRolled.filter((r) => r.pre_budget).length}`);
+
     console.log("\nNothing was written. Re-run without --dry-run to sync.\n");
   } else {
     const out = await syncActuals(db, { env: process.env, guard });
@@ -225,6 +264,19 @@ try {
     /* ⚠ SAID OUT LOUD EVERY RUN, pass or fail. A reconciliation nobody reads is one that reports a
        break the day after the bars started lying. */
     reportReconciliation(out);
+    /* ⚠ THE FIFTH FEED PRINTS TOO. It was added to syncActuals' return and NOT to this report, so
+       its first prod run wrote tens of thousands of rows in total silence — the exact failure every
+       other block here carries a comment about. A feed that reports nothing cannot be told from one
+       that read nothing. */
+    console.log(``);
+    console.log(`forecast history from ${PROJECTION_INQUIRY}`);
+    console.log(`read    ${out.projRead} row(s)${out.projComplete ? "" : " — INCOMPLETE"}`);
+    console.log(`rolled  ${out.projRolled} project x revision x code figure(s)`);
+    console.log(`written ${out.projWritten}`);
+    console.log(`swept   ${out.projSwept}`);
+    console.log(`  revisions       : ${out.projRevisions}`);
+    console.log(`  pre-budget rows : ${out.projPreBudget}`);
+    reportProjectionAgreement(out);
     console.log(`stamped ${out.syncedAt}\n`);
   }
 } catch (e) {
