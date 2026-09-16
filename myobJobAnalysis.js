@@ -70,8 +70,10 @@ export const BUDGET_SELECT = [
    The rows do have cost-code columns, and that is the trap: there are TWO of them with DIFFERENT
    values on the same row (CostCode "1000105" AND CostCode_2 "1000306"), which are artefacts of a
    join. Reading either would attach a whole package's budget to one arbitrary code and look
-   entirely plausible. Cost-code bars in the hub are blocked on this — see
-   MYOB-COSTCODE-INQUIRY.md for exactly what the inquiry would have to return.
+   entirely plausible. ✅ NO LONGER A BLOCKER: the cost-code bars read ALX_JobAnalysis_Detail
+   instead — this inquiry's own _Detail sibling, which returns exactly this grain with ONE cost code
+   per row. See myobCostCodes.js. Nothing here needs changing, and MYOB-COSTCODE-INQUIRY.md is
+   resolved; do not action it.
    The inquiry is small (one row per project × package type, ~171 rows for the whole company) so a
    single page covers it, but an unordered read is undefined regardless of size. */
 export const BUDGET_ORDER = 'Project';
