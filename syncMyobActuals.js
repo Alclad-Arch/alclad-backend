@@ -26,6 +26,9 @@ import {
   rollUpCostCodes, reconcileAgainstPackages,
   COSTCODE_INQUIRY, COSTCODE_SELECT, COSTCODE_ORDER, COSTCODE_NUMERIC,
 } from "./myobCostCodes.js";
+import {
+  rollUpProjections, PROJECTION_INQUIRY, PROJECTION_SELECT, PROJECTION_ORDER,
+} from "./myobCostProjections.js";
 import { shouldRunNow } from "./syncSchedule.js";
 
 export const TABLE = "myob_actuals";
@@ -35,6 +38,9 @@ export const BUDGET_TABLE = "myob_project_budget";
 /* The same money broken down to the cost code, from ALX_JobAnalysis_Detail — what the hub's
    cost-code bars read. Fourth read, same session, for the same licence reason. */
 export const COSTCODE_TABLE = "myob_cost_budget";
+/* Forecast HISTORY per cost code. The biggest of these tables by row count — every revision of
+   every code of every job — and it only grows, so nothing loads it whole. */
+export const PROJECTION_TABLE = "myob_cost_projection";
 export const CHUNK = 500;
 
 /* When did the last successful sync finish? max(synced_at) — every run stamps every row it writes,
@@ -235,6 +241,67 @@ export async function syncActuals(db, {
      would stop the nightly run over a known MYOB quirk; hiding it would be worse. */
   const codeRecon = reconcileAgainstPackages(codeRolled, budgetRolled);
 
+  /* ── THE FORECAST-HISTORY READ ────────────────────────────────────────────────────────────────
+   *
+   * Fifth read, same session. Every revision of every cost code of every job, so this is the
+   * LARGEST of the five by row count and the one that pages most — which is exactly why
+   * PROJECTION_ORDER is project + revision + line: an unordered $skip page can repeat one row and
+   * drop another, and over tens of thousands of rows the total comes up quietly short.
+   *
+   * ⚠ NO PERMISSION WAS NEEDED FOR THIS. ALX_PMCostProjectionLines returns 403 and a request to
+   * have it shared was drafted twice; this inquiry was already readable and carries more. */
+  const projRead = await read({
+    instance: creds.instance, tenant: creds.tenant, inquiry: PROJECTION_INQUIRY,
+    user: creds.user, pass: creds.pass, select: PROJECTION_SELECT, orderBy: PROJECTION_ORDER,
+    cookie: groupRead.cookie,
+  });
+  const projRolled = rollUpProjections(projRead.rows);
+  const projTableRows = projRolled.map((r) => ({
+    project_id: r.project_id,
+    revision: r.revision,
+    cost_code: r.cost_code,
+    cost_code_dashed: r.cost_code_dashed,
+    cost_code_desc: r.cost_code_desc,
+    package_type: r.package_type,
+    is_defect: r.is_defect,
+    account_group: r.account_group,
+    project_task: r.project_task,
+    forecast: r.forecast,
+    to_complete: r.to_complete,
+    variance: r.variance,
+    spend_at: r.spend_at,
+    completed_pct: r.completed_pct,
+    pre_budget: r.pre_budget,
+    lines: r.lines,
+    revised_at: r.revised_at,
+    synced_at: syncedAt,
+  }));
+
+  /* ⚠ THE LATEST REVISION MUST AGREE WITH THE CURRENT FORECAST, and that is what proved the column
+     semantics in the first place: 6163/1000101's newest revision forecasts 12,477, which is exactly
+     the cost_at_completion the per-code feed reports. Checked every run rather than trusted once,
+     because the day they diverge is the day one of the two inquiries changed meaning underneath us.
+     REPORTED, not enforced — a job whose projection was written before its latest budget change can
+     legitimately differ, and refusing would stop the nightly over a bookkeeping order. */
+  const latestByCode = new Map();
+  for (const r of projRolled) {
+    if (r.pre_budget) continue;
+    const k = `${r.project_id}|${r.package_type}|${r.cost_code}`;
+    const cur = latestByCode.get(k);
+    if (!cur || String(r.revised_at || '') > String(cur.revised_at || '')) latestByCode.set(k, r);
+  }
+  const projDrifts = [];
+  for (const c of codeRolled) {
+    if (!c.has_forecast) continue;
+    const hit = latestByCode.get(`${c.project_id}|${c.package_type}|${c.cost_code}`);
+    if (!hit) continue;
+    const d = Math.round((Number(hit.forecast) - Number(c.cost_at_completion)) * 100) / 100;
+    if (Math.abs(d) > 0.005 && projDrifts.length < 20) {
+      projDrifts.push({ project_id: c.project_id, cost_code: c.cost_code, revision: hit.revision,
+                        latest_projection: hit.forecast, cost_at_completion: c.cost_at_completion, diff: d });
+    }
+  }
+
   let written = 0;
   for (const part of chunk(tableRows)) {
     const { error } = await db.from(TABLE).upsert(part, { onConflict: "project_id,cost_code,fin_period" });
@@ -286,6 +353,19 @@ export async function syncActuals(db, {
     budgetSwept = Array.isArray(data) ? data.length : 0;
   }
 
+  /* Written last of the five: a failure here leaves every current figure intact and costs only the
+     history panel, which is the least load-bearing thing the hub shows. */
+  let projWritten = 0;
+  for (const part of chunk(projTableRows)) {
+    const { error } = await db.from(PROJECTION_TABLE).upsert(part, { onConflict: "project_id,revision,cost_code" });
+    if (error) {
+      const e = new Error(`${PROJECTION_TABLE} upsert failed after ${projWritten} row(s): ${error.message}`);
+      e.written = projWritten;
+      throw e;
+    }
+    projWritten += part.length;
+  }
+
   let codeSwept = 0;
   /* Its own read, its own write count — a third independent decision. This feed pages, so a
      truncated read is a live possibility here in a way it is not for the ~171-row package inquiry,
@@ -294,6 +374,16 @@ export async function syncActuals(db, {
     const { data, error } = await db.from(COSTCODE_TABLE).delete().lt("synced_at", syncedAt).select("project_id");
     if (error) throw new Error(`${COSTCODE_TABLE} sweep failed: ${error.message}`);
     codeSwept = Array.isArray(data) ? data.length : 0;
+  }
+
+  let projSwept = 0;
+  /* Its own read, its own count — the fifth independent decision. This feed pages the most of the
+     five, so a truncated read is likeliest here, and sweeping after one would delete the history of
+     every job the read never reached. */
+  if (shouldSweep({ complete: projRead.complete === true, rowsWritten: projWritten })) {
+    const { data, error } = await db.from(PROJECTION_TABLE).delete().lt("synced_at", syncedAt).select("project_id");
+    if (error) throw new Error(`${PROJECTION_TABLE} sweep failed: ${error.message}`);
+    projSwept = Array.isArray(data) ? data.length : 0;
   }
 
   let swept = 0;
@@ -313,7 +403,7 @@ export async function syncActuals(db, {
     rolled: rolled.length,
     written,
     swept,
-    requests: requests + groupRead.requests + budgetRead.requests + codeRead.requests,
+    requests: requests + groupRead.requests + budgetRead.requests + codeRead.requests + projRead.requests,
     sessionReused,
     complete: complete === true,
     /* Said out loud in the report, because "which groups counted as cost" is the question behind
@@ -345,6 +435,19 @@ export async function syncActuals(db, {
     codeDrifts: codeRecon.drifts.slice(0, 20),
     codeDriftCount: codeRecon.drifts.length,
     codeUnmatched: codeRecon.unmatched.length,
+    /* The forecast-history half — fourth set of numbers, reported separately for the same reason as
+       the other three: a feed that read nothing must not hide behind one that worked. */
+    projRead: projRead.rows.length,
+    projRolled: projRolled.length,
+    projWritten,
+    projSwept,
+    projComplete: projRead.complete === true,
+    projRevisions: new Set(projRolled.map((r) => `${r.project_id}|${r.revision}`)).size,
+    projPreBudget: projRolled.filter((r) => r.pre_budget).length,
+    /* ⚠ Does the newest revision still agree with the current forecast? That agreement is what
+       proved what these columns MEAN, so it is checked every run rather than trusted once. */
+    projAgrees: projDrifts.length === 0,
+    projDrifts,
     /* How many package figures the reconciliation actually checked. Without it the report reads
        "matched on all package(s)" — which is equally true of having compared none. */
     compared: codeRecon.compared,

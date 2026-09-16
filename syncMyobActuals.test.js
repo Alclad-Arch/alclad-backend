@@ -12,6 +12,7 @@ import { syncActuals, chunk, shouldSweep, toTableRows, TABLE } from "./syncMyobA
 import { GROUPS_INQUIRY, ACTUALS_INQUIRY } from "./myobOdataRead.js";
 import { BUDGET_INQUIRY } from "./myobJobAnalysis.js";
 import { COSTCODE_INQUIRY } from "./myobCostCodes.js";
+import { PROJECTION_INQUIRY } from "./myobCostProjections.js";
 
 const CREDS = {
   instance: "https://alcladarchitectural.myobadvanced.com",
@@ -293,9 +294,11 @@ test("a BLANK account group refuses too, rather than vanishing", async () => {
     /\(blank\)/);
 });
 
-test("all FOUR reads share ONE session", async () => {
+test("all FIVE reads share ONE session", async () => {
   /* Sessions, not requests, are what the Acumatica licence counts — so adding an inquiry must never
-     add a session. Was three; ALX_JobAnalysis_Detail made it four, and it reuses the same cookie. */
+     add a session. Was three; ALX_JobAnalysis_Detail made it four and
+     VelixoReportsPro-CostProjectionDetail five, each reusing the same cookie. This assertion is the
+     reason that stays true: it has caught every addition so far. */
   const seen = [];
   await syncActuals(fakeDb(), {
     creds: CREDS,
@@ -305,10 +308,10 @@ test("all FOUR reads share ONE session", async () => {
       return { rows: [], requests: 1, complete: true, cookie: args.cookie };
     },
   });
-  assert.equal(seen.length, 4, seen.map((x) => x.inquiry).join(", "));
+  assert.equal(seen.length, 5, seen.map((x) => x.inquiry).join(", "));
   assert.deepEqual(seen.map((x) => x.inquiry).slice(1).sort(),
-    [ACTUALS_INQUIRY, BUDGET_INQUIRY, COSTCODE_INQUIRY].sort(),
-    "the three data reads, by name — a renamed inquiry must fail here, not at 1am");
+    [ACTUALS_INQUIRY, BUDGET_INQUIRY, COSTCODE_INQUIRY, PROJECTION_INQUIRY].sort(),
+    "the four data reads, by name — a renamed inquiry must fail here, not at 1am");
   assert.equal(seen[0].inquiry, GROUPS_INQUIRY, "classification first — without it nothing is safe to store");
   for (const r of seen.slice(1)) {
     assert.equal(r.cookie, "SESS=1", `${r.inquiry} opened its own session instead of reusing`);
