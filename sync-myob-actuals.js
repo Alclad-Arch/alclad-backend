@@ -17,6 +17,40 @@ import {
   readInquiry, rollUpActuals, groupTotals, classifyGroups, unknownGroups,
   ACTUALS_INQUIRY, ACTUALS_SELECT, ACTUALS_ORDER, GROUPS_INQUIRY, GROUPS_SELECT,
 } from "./myobOdataRead.js";
+import {
+  rollUpJobAnalysis, BUDGET_INQUIRY, BUDGET_SELECT, BUDGET_ORDER,
+} from "./myobJobAnalysis.js";
+import {
+  rollUpCostCodes, reconcileAgainstPackages,
+  COSTCODE_INQUIRY, COSTCODE_SELECT, COSTCODE_ORDER,
+} from "./myobCostCodes.js";
+
+/* Whether the per-code figures sum to the per-package ones. Shared by the dry run and the real run
+ * so the two cannot report it differently — the dry run exists precisely so this can be checked
+ * before anything is written, and a second copy of the wording is a second thing to keep in step.
+ *
+ * ⚠ A DRIFT IS NOT AUTOMATICALLY A BUG. ALX_JobAnalysis floors CostProjection at 0 on an overspent
+ * job where ALX_JobAnalysis_Detail does not, so an overspent job may legitimately differ — and
+ * where it does, the DETAIL figure is the more faithful one. Which is why this prints the jobs
+ * rather than failing the run: the list is the evidence for deciding that, and 5477 is the job to
+ * look for. */
+function reportReconciliation(out) {
+  if (out.codeReconciles) {
+    const n = out.compared == null ? '' : `${out.compared} `;
+    console.log(`  ✓ per-code sums match the per-package figures on all ${n}package(s) compared`);
+    return;
+  }
+  console.log(`  ⚠ ${out.codeDriftCount} package figure(s) DO NOT match the per-code sums:`);
+  for (const d of out.codeDrifts) {
+    console.log(`      ${d.project_id} ${d.package_type} ${d.field.padEnd(18)} per-code ${d.per_code.toFixed(2).padStart(14)}  per-package ${d.per_package.toFixed(2).padStart(14)}  diff ${d.diff.toFixed(2)}`);
+  }
+  if (out.codeDriftCount > out.codeDrifts.length) {
+    console.log(`      … ${out.codeDriftCount - out.codeDrifts.length} more not listed`);
+  }
+  console.log(`  An OVERSPENT job drifting here is expected — ALX_JobAnalysis floors CostProjection`);
+  console.log(`  at 0 and the _Detail inquiry does not. Anything else needs looking at before the`);
+  console.log(`  bars are trusted: they would contradict the dials above them and neither would say so.`);
+}
 
 const dry = process.argv.includes("--dry-run");
 /* --guard applies the same once-a-day rule the scheduler uses, read from max(synced_at) in the
@@ -107,6 +141,53 @@ try {
     console.log(`\nlargest by actual cost — check a couple against the Projects screen in MYOB`);
     console.log(`(the figure to match is ACTUAL EXPENSES, not Actual Cost minus income):`);
     for (const [p, amt] of top) console.log(`  ${p.padEnd(12)} ${amt.toFixed(2)}`);
+
+    /* ── THE BUDGET AND COST-CODE FEEDS, ON THE SAME SESSION ────────────────────────────────────
+     *
+     * ⚠ THIS PATH USED TO STOP AT THE LEDGER, and that was a hole rather than a shortcut: a dry run
+     * reported healthily while saying NOTHING about the two other inquiries a real run reads and
+     * writes. Someone reading "Nothing was written" reasonably concluded the whole run was
+     * understood. Cost codes were added on 2026-09-16 and the gap became obvious — the one check
+     * that makes the bars trustworthy was the one the safe-to-run-against-prod path skipped.
+     *
+     * Both reads reuse the cookie, so a dry run still costs ONE Acumatica session. */
+    const budgetRead = await readInquiry({
+      instance: creds.instance, tenant: creds.tenant, inquiry: BUDGET_INQUIRY,
+      user: creds.user, pass: creds.pass, select: BUDGET_SELECT, orderBy: BUDGET_ORDER,
+      cookie: groupRead.cookie,
+    });
+    const budgetRolled = rollUpJobAnalysis(budgetRead.rows);
+    console.log(`\ncontract/budget from ${BUDGET_INQUIRY}`);
+    console.log(`read ${budgetRead.rows.length} row(s) → ${budgetRolled.length} project × package figure(s)`);
+
+    const codeRead = await readInquiry({
+      instance: creds.instance, tenant: creds.tenant, inquiry: COSTCODE_INQUIRY,
+      user: creds.user, pass: creds.pass, select: COSTCODE_SELECT, orderBy: COSTCODE_ORDER,
+      cookie: groupRead.cookie,
+    });
+    /* rollUpCostCodes THROWS if the inquiry's two cost-code columns disagree. Caught and REPORTED
+       here rather than allowed to kill the process: seeing the problem is the whole point of a dry
+       run, and a real run refusing is the correct behaviour for the same fact. */
+    let codeRolled = null;
+    try {
+      codeRolled = rollUpCostCodes(codeRead.rows);
+    } catch (err) {
+      console.log(`\n⚠ ${COSTCODE_INQUIRY} — A REAL RUN WOULD REFUSE:`);
+      console.log(`  ${(err && err.message) || err}`);
+    }
+    if (codeRolled) {
+      console.log(`\ncost codes from ${COSTCODE_INQUIRY}`);
+      console.log(`read ${codeRead.rows.length} row(s)${codeRead.complete ? "" : " — ⚠ INCOMPLETE, a real run would not sweep"}`);
+      console.log(`rolls up to ${codeRolled.length} project × package × code figure(s)`);
+      console.log(`  with a budget   : ${codeRolled.filter((r) => r.has_budget).length}`);
+      console.log(`  with a forecast : ${codeRolled.filter((r) => r.has_forecast).length}`);
+      console.log(`  defect codes    : ${codeRolled.filter((r) => r.is_defect).length}`);
+      const recon = reconcileAgainstPackages(codeRolled, budgetRolled);
+      reportReconciliation({
+        codeReconciles: recon.ok, codeDrifts: recon.drifts.slice(0, 20),
+        codeDriftCount: recon.drifts.length, compared: recon.compared, codeRolled: codeRolled.length,
+      });
+    }
     console.log("\nNothing was written. Re-run without --dry-run to sync.\n");
   } else {
     const out = await syncActuals(db, { env: process.env, guard });
@@ -130,6 +211,20 @@ try {
     console.log(`swept   ${out.budgetSwept}`);
     console.log(`  with a contract value : ${out.withContractValue}`);
     console.log(`  with a cost budget    : ${out.withCostBudget}`);
+    /* The cost-code half. Reported separately again — three feeds, three sets of numbers, so one
+       that read nothing cannot hide behind another that worked. */
+    console.log(``);
+    console.log(`cost codes from ${COSTCODE_INQUIRY}`);
+    console.log(`read    ${out.codeRead} row(s)${out.codeComplete ? "" : " — INCOMPLETE"}`);
+    console.log(`rolled  ${out.codeRolled} project x package x code figure(s)`);
+    console.log(`written ${out.codeWritten}`);
+    console.log(`swept   ${out.codeSwept}`);
+    console.log(`  with a budget   : ${out.codesWithBudget}`);
+    console.log(`  with a forecast : ${out.codesWithForecast}`);
+    console.log(`  defect codes    : ${out.codeDefects}`);
+    /* ⚠ SAID OUT LOUD EVERY RUN, pass or fail. A reconciliation nobody reads is one that reports a
+       break the day after the bars started lying. */
+    reportReconciliation(out);
     console.log(`stamped ${out.syncedAt}\n`);
   }
 } catch (e) {

@@ -345,6 +345,9 @@ export async function syncActuals(db, {
     codeDrifts: codeRecon.drifts.slice(0, 20),
     codeDriftCount: codeRecon.drifts.length,
     codeUnmatched: codeRecon.unmatched.length,
+    /* How many package figures the reconciliation actually checked. Without it the report reads
+       "matched on all package(s)" — which is equally true of having compared none. */
+    compared: codeRecon.compared,
     syncedAt,
     as: creds.user,
     /* Named so a summary can say it out loud: the whole point of the roll-up is that these two
