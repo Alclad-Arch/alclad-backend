@@ -65,7 +65,14 @@ export const BUDGET_SELECT = [
 ];
 
 /* Ordered so $skip paging is deterministic — see the $orderby note in myobOdataRead.js. The
-   inquiry is small (one row per project × task × cost code, ~171 rows for the whole company) so a
+   ⚠ THIS USED TO SAY "one row per project × task × cost code". IT IS NOT. Probing 6163 on the live
+   tenant returns TWO rows — one per package type — each carrying that package's whole BudgetCost.
+   The rows do have cost-code columns, and that is the trap: there are TWO of them with DIFFERENT
+   values on the same row (CostCode "1000105" AND CostCode_2 "1000306"), which are artefacts of a
+   join. Reading either would attach a whole package's budget to one arbitrary code and look
+   entirely plausible. Cost-code bars in the hub are blocked on this — see
+   MYOB-COSTCODE-INQUIRY.md for exactly what the inquiry would have to return.
+   The inquiry is small (one row per project × package type, ~171 rows for the whole company) so a
    single page covers it, but an unordered read is undefined regardless of size. */
 export const BUDGET_ORDER = 'Project';
 
