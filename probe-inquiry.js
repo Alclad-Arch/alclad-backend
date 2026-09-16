@@ -41,12 +41,21 @@ const flag = (name, dflt = null) => {
 };
 const inquiry = argv.find((a) => !a.startsWith("--") && argv.indexOf(a) === 0);
 if (!inquiry) {
-  console.error("usage: node probe-inquiry.js <InquiryName> [--job 6163] [--rows 2] [--sum BudgetCost]");
+  console.error('usage: node probe-inquiry.js <InquiryName> [--job 6163] [--col ProjectID] [--filter "<raw OData>"] [--rows 2] [--sum BudgetCost]');
   process.exit(1);
 }
 const job = flag("job");
 const rows = Number(flag("rows", "2")) || 2;
 const sumCol = flag("sum");
+/* ⚠ THE JOB COLUMN IS NOT ALWAYS CALLED `Project`. ALX_JobTrans and ALX_JobAnalysis(_Detail) use
+   `Project`; VelixoReportsPro-CostProjectionDetail uses `ProjectID` — and in
+   VelixoReportsPro-CostBudgets `ProjectID` is an INTERNAL id while `ProjectID_2` is the job number,
+   which is the reverse of CostProjectionDetail. The `ID` suffix means nothing in this tenant, so
+   the column has to be nameable rather than assumed.
+     --col ProjectID          filter that column instead of `Project`
+     --filter "<raw OData>"   anything more complicated, e.g. startswith(ProjectID,'6163') */
+const jobCol = flag("col", "Project");
+const rawFilter = flag("filter");
 
 const db = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
@@ -65,7 +74,7 @@ try {
   res = await readInquiry({
     ...creds,
     inquiry,
-    filter: job ? `Project eq '${String(job).replace(/'/g, "''")}'` : "",
+    filter: rawFilter || (job ? `${jobCol} eq '${String(job).replace(/'/g, "''")}'` : ""),
     maxRows: sumCol ? 100000 : Math.max(rows, 50),
   });
 } catch (e) {
@@ -102,7 +111,7 @@ if (sumCol) {
   };
   const by = new Map();
   for (const r of all) {
-    const key = `${r.Project ?? "?"} · Type ${r.Type ?? "?"}`;
+    const key = `${r.Project ?? r.ProjectID ?? "?"} · Type ${r.Type ?? "?"}`;
     by.set(key, (by.get(key) || 0) + num(r[sumCol]));
   }
   console.log(`\n${line}\n  SUM of ${sumCol}, grouped by Project × Type`);
