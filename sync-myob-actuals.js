@@ -301,6 +301,12 @@ try {
     /* THE HONEST CEILING ON THE DRILL-DOWN: how much of the ledger can be traced to a supplier's
        own invoice at all. Receipts and timecards never can, and that is a fact about the document
        trail rather than missing data. */
+    /* ⚠ COST vs REVENUE. Alclad books income through account groups named after the PACKAGES, as
+       credits, so a breakdown that sums every line reports cost netted against income — which on
+       6163 gave supplier percentages adding to 146%. This count is how you see at a glance that the
+       classification actually ran: if it reads 0, every line is flagged revenue and the drill-down
+       will show nothing (fail-closed, and visible). */
+    console.log(`  cost lines                     : ${out.ledgerCostLines}`);
     console.log(`  with a supplier invoice number : ${out.ledgerWithInvoice}`);
     console.log(`stamped ${out.syncedAt}\n`);
   }

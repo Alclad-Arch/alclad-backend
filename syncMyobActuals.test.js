@@ -528,6 +528,15 @@ test("⚠ the runner reports EVERY feed the sync writes", () => {
   for (const [table, field] of feeds) {
     assert.ok(runner.includes(field), `${table}: the report never prints ${field}`);
   }
+
+  /* ⚠ AND THE SUMMARY FIELDS, because the written-count alone was not enough. ledgerCostLines was
+     added to the return and not to the report — the THIRD time in one session — and the first
+     version of this test did not cover it because it only listed the *Written fields. A number the
+     sync computes and nobody prints is a number nobody can act on. */
+  for (const field of ["out.ledgerCostLines", "out.ledgerWithInvoice", "out.ledgerBySource",
+                       "out.codesWithBudget", "out.projRevisions", "out.projPreBudget"]) {
+    assert.ok(runner.includes(field), `the report never prints ${field}`);
+  }
 });
 
 test("…and the sync actually returns each of those counts", async () => {
