@@ -500,3 +500,47 @@ test("an empty budget read writes nothing and sweeps nothing", async () => {
   assert.equal(out.budgetWritten, 0);
   assert.equal(out.budgetSwept, 0);
 });
+
+// ── ⚠ A FEED THAT REPORTS NOTHING CANNOT BE TOLD FROM ONE THAT READ NOTHING ──
+/* This was missed TWICE in one session — the forecast history wrote 27,821 rows and the transaction
+ * detail wrote ~54,000, both in complete silence, because each was added to syncActuals' RETURN
+ * VALUE and not to the runner's report. The only reason the first was noticed is that the request
+ * count jumped.
+ *
+ * A note was written after the first one saying "adding a feed means adding its report line in the
+ * same change". It did not work. So this asserts it instead: every written-count the sync returns
+ * must be referenced by the script that prints the report. Crude — it reads the source — but it
+ * fails the moment a seventh feed is added silently, which is exactly when it needs to.
+ */
+import { readFileSync } from "node:fs";
+
+test("⚠ the runner reports EVERY feed the sync writes", () => {
+  const runner = readFileSync(new URL("./sync-myob-actuals.js", import.meta.url), "utf8");
+  /* One entry per table syncActuals writes. Adding a feed without adding it here is itself the
+     omission this guards against, so the list is deliberately spelled out rather than derived. */
+  const feeds = [
+    ["myob_actuals", "out.written"],
+    ["myob_project_budget", "out.budgetWritten"],
+    ["myob_cost_budget", "out.codeWritten"],
+    ["myob_cost_projection", "out.projWritten"],
+    ["myob_ledger_line", "out.ledgerWritten"],
+  ];
+  for (const [table, field] of feeds) {
+    assert.ok(runner.includes(field), `${table}: the report never prints ${field}`);
+  }
+});
+
+test("…and the sync actually returns each of those counts", async () => {
+  /* The other half: a report line referencing a field the sync does not return prints `undefined`,
+     which reads as a feed that wrote nothing. */
+  const out = await syncActuals(fakeDb(), {
+    creds: CREDS,
+    read: oneRead([{ Project: "6667", CostCode: "C", AccountGroup: "STAFF", FinPeriod: "012027", Amount: 1, TranID: 1 }]),
+  });
+  for (const f of ["written", "budgetWritten", "codeWritten", "projWritten", "ledgerWritten"]) {
+    assert.equal(typeof out[f], "number", f);
+  }
+  /* And the drill-down's own summary, which is what says how much of the ledger is traceable. */
+  assert.equal(typeof out.ledgerWithInvoice, "number");
+  assert.equal(typeof out.ledgerBySource, "object");
+});

@@ -55,8 +55,18 @@ function reportProjectionAgreement(out) {
   for (const d of out.projDrifts) {
     console.log(`      ${d.project_id} ${d.cost_code} ${String(d.revision).padEnd(14)} projection ${d.latest_projection.toFixed(2).padStart(13)}  current ${d.cost_at_completion.toFixed(2).padStart(13)}  diff ${d.diff.toFixed(2)}`);
   }
-  console.log(`  A projection written before the latest budget change can differ legitimately.`);
-  console.log(`  Anything else means one of the two inquiries has changed meaning.`);
+  /* ⚠ THE FIRST PROD RUN REFRAMED THIS. 2,211 of 2,231 codes matched exactly; the 20 that did not
+     were all on three jobs — 0087, 4870, 5246 — whose newest projection dates from 2025. That is
+     not two inquiries disagreeing, it is ONE STALE PROJECTION, and the wording here said the
+     opposite loudly enough to send someone looking for a bug.
+     Why it happens: cost_at_completion is recomputed by MYOB as costs_to_date + cost_projection +
+     open_committed, so it MOVES as spend moves. A projection written eighteen months ago and never
+     revised is therefore left behind by it — which is precisely what the forecast-health panel
+     exists to surface. */
+  console.log(`  This is STALENESS, not disagreement: cost at completion tracks spend, so a`);
+  console.log(`  projection nobody has revised since is left behind by it. These are the jobs`);
+  console.log(`  whose forecasts have stopped being maintained.`);
+  console.log(`  Worry only if a job with a RECENT projection appears here.`);
 }
 
 function reportReconciliation(out) {
@@ -277,6 +287,21 @@ try {
     console.log(`  revisions       : ${out.projRevisions}`);
     console.log(`  pre-budget rows : ${out.projPreBudget}`);
     reportProjectionAgreement(out);
+    /* ⚠ THE SIXTH FEED. This was missed TWICE — once for the forecast history and again for this
+       one, in the same session, after a note had been written saying "adding a feed means adding
+       its report line in the same change". Discipline did not work; syncMyobActuals.test.js now
+       asserts this file mentions every feed's written-count, so a seventh cannot be added silently. */
+    console.log(``);
+    console.log(`transaction detail from ${ACTUALS_INQUIRY} (same read, no extra request)`);
+    console.log(`written ${out.ledgerWritten} ledger line(s)`);
+    console.log(`swept   ${out.ledgerSwept}`);
+    for (const [src, n] of Object.entries(out.ledgerBySource || {}).sort((a, b) => b[1] - a[1])) {
+      console.log(`  ${String(src).padEnd(9)} ${String(n).padStart(7)}`);
+    }
+    /* THE HONEST CEILING ON THE DRILL-DOWN: how much of the ledger can be traced to a supplier's
+       own invoice at all. Receipts and timecards never can, and that is a fact about the document
+       trail rather than missing data. */
+    console.log(`  with a supplier invoice number : ${out.ledgerWithInvoice}`);
     console.log(`stamped ${out.syncedAt}\n`);
   }
 } catch (e) {

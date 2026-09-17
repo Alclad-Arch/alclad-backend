@@ -93,7 +93,7 @@ export class LedgerGrainError extends Error {
  * is what makes $skip paging deterministic across 108 requests — so a duplicate means either the
  * inquiry changed or the paging repeated a row, and both would silently corrupt the figures in
  * myob_actuals as well. Better a loud nightly failure than a quiet double count. */
-export function toLedgerLines(rows = [], syncedAt = null) {
+export function toLedgerLines(rows = [], syncedAt = null, { costGroups = null } = {}) {
   const out = [];
   const seen = new Set();
   const dupes = [];
@@ -116,6 +116,16 @@ export function toLedgerLines(rows = [], syncedAt = null) {
       tran_id: tranId,
       cost_code: str(r.CostCode),
       account_group: str(r.AccountGroup),
+      /* ⚠ COST OR REVENUE, FROM THE TENANT'S OWN CLASSIFICATION — never inferred from the sign.
+         Alclad books revenue through account groups named after the PACKAGES (GLAZING, CLADDING,
+         RECLAD, FINS) as credits, so a breakdown that sums blind reports cost netted against
+         revenue. That is not hypothetical: it is what made one project read 10,734,945.75 on the
+         first dry run of this feed, and it came back on 6163's vendor panel as percentages adding
+         to 146% and a "not attributable" line of −86,131.14.
+         Null costGroups means the caller did not classify, and then nothing is claimed either way —
+         is_cost stays false rather than guessing, and a consumer filtering on it gets nothing
+         rather than everything. */
+      is_cost: costGroups ? costGroups.has(str(r.AccountGroup)) : false,
       cost_code_grp: str(r.CostCodeGrp),
       fin_period: str(r.FinPeriod),
       source,

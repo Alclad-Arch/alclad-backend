@@ -52,7 +52,10 @@ const LABOUR = {
   Qty: 6, Amount: 462, UnitRate: 77, UOM: 'HOUR',
 };
 
-const lines = toLedgerLines([BILL, RECEIPT, LABOUR], 'T');
+/* ⚠ WITH THE TENANT'S CLASSIFICATION. Without it every line is is_cost=false and a spend breakdown
+   sees nothing — which is the deliberate fail-closed, tested below. */
+const COST_GROUPS = new Set(['SUBCONT', 'MATERIAL', 'STAFF', 'EQUIP', 'OTHER', 'CONSULT', 'LABOUR']);
+const lines = toLedgerLines([BILL, RECEIPT, LABOUR], 'T', { costGroups: COST_GROUPS });
 const line = (id) => lines.find((l) => l.tran_id === id);
 
 test('every column these rows need is actually requested from the inquiry', () => {
@@ -180,4 +183,36 @@ test('an unparseable amount cannot poison the row', () => {
 test('synced_at is omitted entirely when none is given', () => {
   const [l] = toLedgerLines([BILL]);
   assert.equal('synced_at' in l, false);
+});
+
+// ── ⚠ COST OR REVENUE — the verdict has to travel with the row ──────────────
+/* The table stored account_group but not the tenant's verdict on it, so the vendor breakdown summed
+ * every line. Alclad books revenue through account groups named after the PACKAGES (GLAZING,
+ * CLADDING, RECLAD, FINS) as CREDITS — so on 6163 the panel showed supplier percentages adding to
+ * 146% and a "not attributable" line of −86,131.14: cost netted against income.
+ *
+ * Which is the same failure this feed hit on its first dry run, when one project reported
+ * 10,734,945.75. myob_actuals has classified from the tenant ever since; the detail table simply
+ * never carried the answer forward.
+ */
+test('⚠ cost lines are flagged from the tenant classification', () => {
+  assert.ok(lines.every((l) => l.is_cost), 'SUBCONT, MATERIAL and STAFF are all expense groups');
+});
+
+test('⚠ a REVENUE line is flagged false — its group is named after the package', () => {
+  const income = { ...BILL, TranID: 99, AccountGroup: 'CLADDING', Amount: -86131.14 };
+  const [l] = toLedgerLines([income], null, { costGroups: COST_GROUPS });
+  assert.equal(l.is_cost, false);
+  /* ⚠ AND NOT BECAUSE IT IS NEGATIVE. The verdict is the account group's Type in MYOB; a credit can
+     be a reversal, which is a negative COST and must stay in the spend. */
+  const reversal = { ...BILL, TranID: 98, Amount: -250 };
+  const [rev] = toLedgerLines([reversal], null, { costGroups: COST_GROUPS });
+  assert.equal(rev.is_cost, true, 'a negative amount on an expense group is still cost');
+});
+
+test('⚠ with NO classification nothing is claimed — is_cost stays false', () => {
+  /* Fail closed. A consumer filtering on the flag then sees nothing, which is visibly wrong, rather
+     than seeing everything, which looks right and is not. */
+  const [l] = toLedgerLines([BILL]);
+  assert.equal(l.is_cost, false);
 });

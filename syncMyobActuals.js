@@ -173,7 +173,7 @@ export async function syncActuals(db, {
      costs nothing but the columns already in ACTUALS_SELECT.
      toLedgerLines REFUSES on a duplicate TranID, which would mean paging repeated a row — and that
      would have double-counted the figures above it too, silently. */
-  const ledgerLines = toLedgerLines(rows, syncedAt);
+  const ledgerLines = toLedgerLines(rows, syncedAt, { costGroups });
 
   /* ── THE CONTRACT AND BUDGET READ ─────────────────────────────────────────────────────────────
    *
@@ -487,6 +487,9 @@ export async function syncActuals(db, {
     ledgerSwept,
     ledgerBySource: ledgerLines.reduce((acc, l) => { acc[l.source] = (acc[l.source] || 0) + 1; return acc; }, {}),
     ledgerWithInvoice: ledgerLines.filter((l) => !!l.supplier_inv_nbr).length,
+    /* ⚠ How many lines are COST. The rest are revenue, and a breakdown that sums them together
+       reports cost netted against income — the failure this feed hit on its very first dry run. */
+    ledgerCostLines: ledgerLines.filter((l) => l.is_cost).length,
     /* How many package figures the reconciliation actually checked. Without it the report reads
        "matched on all package(s)" — which is equally true of having compared none. */
     compared: codeRecon.compared,
