@@ -74,6 +74,10 @@ console.log(`  inquiry          : ${inquiry}`);
 console.log(`  connecting as    : ${d.user}`);
 console.log(`  tenant           : ${d.tenant}`);
 if (job) console.log(`  filtered to job  : ${job}`);
+if (rawFilter) console.log(`  filter           : ${rawFilter}`);
+/* Echoed so a --page that did not take effect is visible. An inquiry that terminates at 500 and
+   again at 25 looks the same as one where the flag was mistyped, and those need opposite responses. */
+console.log(`  rows per request : ${pageSize}`);
 
 let res;
 try {
