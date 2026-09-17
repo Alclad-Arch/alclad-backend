@@ -41,7 +41,7 @@ const flag = (name, dflt = null) => {
 };
 const inquiry = argv.find((a) => !a.startsWith("--") && argv.indexOf(a) === 0);
 if (!inquiry) {
-  console.error('usage: node probe-inquiry.js <InquiryName> [--job 6163] [--col ProjectID] [--filter "<raw OData>"] [--rows 2] [--sum BudgetCost]');
+  console.error('usage: node probe-inquiry.js <InquiryName> [--job 6163] [--col ProjectID] [--filter "<raw OData>"] [--rows 2] [--page 25] [--sum BudgetCost]');
   process.exit(1);
 }
 const job = flag("job");
@@ -55,6 +55,12 @@ const sumCol = flag("sum");
      --col ProjectID          filter that column instead of `Project`
      --filter "<raw OData>"   anything more complicated, e.g. startswith(ProjectID,'6163') */
 const jobCol = flag("col", "Project");
+/* ⚠ SOME INQUIRIES CANNOT ANSWER A 500-ROW PAGE. PM-Project Summary returned "terminated" — not a
+   404 and not a 403, but the server giving up mid-request, which is what a wide summary inquiry does
+   when asked for too much at once. A smaller page is the difference between "this does not exist"
+   and "ask more politely".
+     --page 25    fetch 25 rows per request instead of 500 */
+const pageSize = Number(flag("page", "500")) || 500;
 const rawFilter = flag("filter");
 
 const db = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
@@ -75,12 +81,17 @@ try {
     ...creds,
     inquiry,
     filter: rawFilter || (job ? `${jobCol} eq '${String(job).replace(/'/g, "''")}'` : ""),
-    maxRows: sumCol ? 100000 : Math.max(rows, 50),
+    pageSize,
+    maxRows: sumCol ? 100000 : Math.max(rows, Math.min(50, pageSize)),
   });
 } catch (e) {
   /* Named rather than swallowed: "inquiry not found" and "not exposed via OData" are different
      problems with different fixes, and the message is the only thing that tells them apart. */
   console.error(`\n✗ could not read "${inquiry}"\n  ${(e && e.message) || e}`);
+  console.error(`\n  If it says "terminated": the SERVER gave up, not us. A wide summary inquiry`);
+  console.error(`  asked for 500 rows at once does this — PM-Project Summary did. Retry with`);
+  console.error(`  --page 25 BEFORE concluding anything: that is the difference between "this`);
+  console.error(`  does not exist" and "ask for less at a time".`);
   console.error(`\n  If it says 404 / not found: check the name, and that the inquiry is EXPOSED`);
   console.error(`  VIA ODATA on its Generic Inquiry screen — an inquiry that works in the browser`);
   console.error(`  is invisible over OData until that box is ticked.\n`);
