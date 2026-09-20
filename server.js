@@ -325,8 +325,54 @@ app.get("/api/oauth/callback", async (req, res) => {
 
 // --- Refresh helper (handles rotation), persists the rotated tokens ---
 // `row` must already be decrypted (openRow); what goes back to the database is re-sealed.
+/* ⚠ ONE REFRESH PER USER AT A TIME — the same race that killed the SERVICE grant on 2026-09-14,
+ * left unfixed on the per-user path because that is where it was not looked for.
+ *
+ * Salesforce rotates a refresh token on use and invalidates the old one. Two concurrent callers
+ * both read the same stored row, both post the SAME refresh token: the first rotates it, the
+ * second is refused, and whichever write lands last can store a token Salesforce has already
+ * discarded. It then sits in the table looking perfectly normal until the next refresh returns
+ * invalid_grant — "Salesforce session expired — reconnect", with nothing in the logs, because
+ * every individual step succeeded.
+ *
+ * THE PROPOSAL SCREEN IS A TEXTBOOK TRIGGER. It opens with
+ *
+ *     Promise.allSettled([fetchOppContacts(oppId), fetchOpportunity(oppId, sfOppMap)])
+ *
+ * — two parallel reads through this proxy. If the access token has expired, BOTH 401 and BOTH
+ * land here at once. Reconnect, open a proposal, and the grant dies on the spot: exactly the
+ * "his Salesforce is confirmed connected" reports of 2026-09-18 and 2026-09-21.
+ *
+ * Per USER, not global: one person's refresh has no reason to wait behind another's, and a single
+ * global queue would serialise every user behind the slowest round trip. WEB_CONCURRENCY=1 on
+ * Render (logged 2026-09-14), so a per-process map is enough and no database lease is needed —
+ * revisit only if that changes. The map holds one small closure per user who has ever refreshed. */
+const userQueues = new Map();
+const userQueue = (userId) => {
+  let q = userQueues.get(userId);
+  if (!q) { q = serialQueue(); userQueues.set(userId, q); }
+  return q;
+};
+
 async function refreshSalesforce(userId, row) {
   if (!row.refresh_token) return null;
+  return userQueue(userId)(async () => {
+    /* RE-READ INSIDE THE QUEUE. A caller that waited its turn may find the refresh already done by
+     * the one in front, and must take that result rather than posting a token that has just been
+     * rotated away. The test is the refresh token itself: if the stored one is no longer what this
+     * caller arrived with, somebody else rotated it and theirs is the live grant.
+     * Not the same as the service account's cache re-check — there is no in-memory cache here, the
+     * row IS the state — but it is the same idea and it is what makes the queue useful rather than
+     * merely orderly. */
+    const { data: raw } = await supabaseAdmin.from("salesforce_tokens").select("*").eq("user_id", userId).maybeSingle();
+    const cur = raw ? openRow(raw, userId) : null;
+    if (!cur || !cur.refresh_token) return null;
+    if (cur.refresh_token !== row.refresh_token) return cur;   // already refreshed while we waited
+    return refreshSalesforceNow(userId, cur);
+  });
+}
+
+async function refreshSalesforceNow(userId, row) {
   const body = new URLSearchParams({
     grant_type: "refresh_token",
     refresh_token: row.refresh_token,
