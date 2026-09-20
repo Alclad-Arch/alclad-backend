@@ -174,6 +174,11 @@ export const ACTUALS_INQUIRY = 'ALX_JobTrans';
    See myobLedgerLines.js for what each of them means and, more importantly, when each is null. */
 export const ACTUALS_SELECT = [
   'Project', 'ProjectName', 'CostCode', 'AccountGroup', 'CostCodeGrp', 'FinPeriod', 'Amount', 'Qty', 'TranID',
+  /* WHO THE JOB IS FOR. ALX_JobAnalysis does not carry a customer at all — probed 2026-09-21 for
+     exactly this, 31 fields and none of them the builder — but the transaction feed does, on
+     every row. Same lesson as the cost-code inquiry: the data was already there under another
+     name, and asking MYOB to build something would have been asking for what we had. */
+  'CustomerCode', 'CustomerName',
   // where it came from — this decides which of the rest are populated
   'Module', 'Type', 'ReferenceNbr', 'Reference', 'SupplierInvNbr',
   // who
@@ -267,10 +272,17 @@ export function rollUpActuals(rows = [], { costGroups = null, incomeGroups = nul
          both, and first-seen-wins: if the name were edited mid-period the figures are the same job
          either way, and the linker only needs it to recognise siblings. */
       project_name: String(r.ProjectName ?? '').trim(),
+      /* The BUILDER, as MYOB bills them. Denormalised onto every row exactly as project_name is,
+         because this feed has no project-level row to hang it on — the view maxes it back up.
+         first-seen-wins for the same reason: a customer renamed mid-period is the same job. */
+      customer_code: String(r.CustomerCode ?? '').trim(),
+      customer_name: String(r.CustomerName ?? '').trim(),
       fin_period: period, actual_amount: 0, income_amount: 0, actual_qty: 0, rows: 0,
     };
     /* A later row can fill a name an earlier one lacked, but never blank one that is already set. */
     if (!cur.project_name) cur.project_name = String(r.ProjectName ?? '').trim();
+    if (!cur.customer_name) cur.customer_name = String(r.CustomerName ?? '').trim();
+    if (!cur.customer_code) cur.customer_code = String(r.CustomerCode ?? '').trim();
     /* THE ACCOUNT GROUP ON A MIXED ROW. One project/cost-code/period can carry both cost and
        income lines, and a single column cannot describe both — so a mixed row is labelled from the
        COST side, which is what the register's figure is about. The view exposes the full set of

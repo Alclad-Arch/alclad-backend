@@ -88,6 +88,9 @@ export function toTableRows(rolled, syncedAt) {
   return rolled.map((r) => ({
     project_id: r.project_id,
     project_name: r.project_name || '',
+    // the builder MYOB bills — see the note in rollUpActuals
+    customer_code: r.customer_code || '',
+    customer_name: r.customer_name || '',
     cost_code: r.cost_code,
     /* Actual revenue INVOICED against the job, positive. Not the contract value, and not the same
        thing as the hub's own sell figure — see the migration note. */
