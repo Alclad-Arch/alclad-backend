@@ -128,3 +128,35 @@ test('the server routes per-user refreshes through a per-user queue', async () =
      call back above the queue. */
   assert.match(src, /async function refreshSalesforceNow\(userId, row\)/, 'the unguarded refresh should be its own function')
 })
+
+test('a failed refresh says WHOSE it was and how many', async () => {
+  /* The line was the error text alone, so a log full of `refresh failed: invalid_grant` could not
+     tell one grant racing itself from several people each failing once — the question the
+     2026-09-21 diagnosis actually turned on, answered from timestamps instead because the line
+     did not carry it. */
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync(new URL('./server.js', import.meta.url), 'utf8')
+  assert.match(src, /refresh failed for user \$\{userId\}/, 'the log line does not name the user')
+  assert.match(src, /\(\$\{userRefreshFails\.get\(userId\)\} so far\)/, 'the log line does not carry a count')
+  assert.match(src, /const userRefreshFails = new Map\(\)/, 'no per-user failure counter')
+})
+
+test('a sealed OData password with NO key set says so, rather than blaming the key', async () => {
+  /* loadKey() returns null when TOKEN_ENC_KEY is absent, so a probe on a laptop that never had the
+     key reported "TOKEN_ENC_KEY may have changed" — which reads as production being broken when
+     production is fine (Jed, 2026-09-21). Two causes, two messages. */
+  const { readFileSync } = await import('node:fs')
+  const { sealedReadError } = await import('./tokenCrypto.js')
+  assert.match(sealedReadError('x', null), /is not set here — a local-shell problem/, 'the no-key case does not say it is local')
+  assert.match(sealedReadError('x', Buffer.alloc(32)), /does not open it/, 'the wrong-key case is not distinguished')
+
+  /* ⚠ ONE HELPER, THREE CALL SITES. It was three copies of one message, which is how two of them
+     kept the old wording after the first was fixed — the same instance-not-class mistake as the
+     refresh race above, and caught here only because this assertion sweeps all three rather than
+     the one file that prompted it. */
+  for (const f of ['myobOdataCreds.js', 'myobToken.js', 'server.js']) {
+    const t = readFileSync(new URL('./' + f, import.meta.url), 'utf8')
+    assert.match(t, /sealedReadError\(/, `${f} does not use the shared message`)
+    assert.ok(!/could not be decrypted — TOKEN_ENC_KEY may have changed/.test(t), `${f} still has the one-size message`)
+  }
+})

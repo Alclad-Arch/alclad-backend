@@ -14,7 +14,7 @@
 // and username, none of which are secret, and all of which a health panel needs in order to say
 // WHO the app is connecting as. Sealed with the same AES-GCM helper as the Salesforce and MYOB
 // OAuth rows, so encryption at rest is one setting for all of them.
-import { seal, unseal, isSealed, loadKey } from "./tokenCrypto.js";
+import { seal, unseal, isSealed, loadKey, sealedReadError } from "./tokenCrypto.js";
 
 export const ODATA_PROVIDER = "myob_odata";
 /* The AAD the seal is bound to. Distinct from the OAuth row's, so a value cannot be moved between
@@ -50,7 +50,12 @@ export async function readOdataCreds(db, env = process.env) {
     /* A row written before TOKEN_ENC_KEY was set is plaintext; unseal only what is sealed, so
        turning encryption on later does not strand the row. */
     const pass = isSealed(stored) ? unseal(stored, SEAL_ID, cfg.encKey) : stored;
-    if (!pass) throw new Error("stored MYOB OData password could not be decrypted — TOKEN_ENC_KEY may have changed");
+    /* TWO DIFFERENT PROBLEMS, and blaming the wrong one costs an afternoon. loadKey() returns
+       NULL when TOKEN_ENC_KEY is simply absent, so running a probe on a laptop that has never had
+       the key said "TOKEN_ENC_KEY may have changed" — which reads as "production is broken" when
+       production is fine and it is the shell that is missing something (Jed, 2026-09-21, probing
+       ALX_JobAnalysis for a customer field). Say which. */
+    if (!pass) throw new Error(sealedReadError("stored MYOB OData password", cfg.encKey));
     const meta = data.meta || {};
     return {
       instance: meta.instance || cfg.instance,

@@ -27,7 +27,7 @@ import express from "express";
 import cors from "cors";
 import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
-import { loadKey, isSealed, seal as sealWith, unseal as unsealWith } from "./tokenCrypto.js";
+import { loadKey, isSealed, seal as sealWith, unseal as unsealWith, sealedReadError } from "./tokenCrypto.js";
 import { buildSummaryQuery, shapeSummary } from "./oppSummary.js";
 import { buildSearchQuery } from "./oppSearch.js";
 import { serialQueue } from "./serialQueue.js";
@@ -348,6 +348,9 @@ app.get("/api/oauth/callback", async (req, res) => {
  * Render (logged 2026-09-14), so a per-process map is enough and no database lease is needed —
  * revisit only if that changes. The map holds one small closure per user who has ever refreshed. */
 const userQueues = new Map();
+// Failed refreshes per user this process, for the log line only — a count is what separates one
+// grant failing repeatedly from several users each failing once.
+const userRefreshFails = new Map();
 const userQueue = (userId) => {
   let q = userQueues.get(userId);
   if (!q) { q = serialQueue(); userQueues.set(userId, q); }
@@ -382,7 +385,15 @@ async function refreshSalesforceNow(userId, row) {
   const r = await fetch(`${process.env.SF_LOGIN_URL}/services/oauth2/token`, {
     method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body,
   });
-  if (!r.ok) { console.error("refresh failed:", await r.text()); return null; }
+  /* WHOSE refresh, and how many have failed. The line used to be the error text alone, so a log
+     full of `refresh failed: invalid_grant` could not distinguish one person's grant racing itself
+     from several people each failing once — which is exactly the question the 2026-09-21
+     diagnosis turned on, and it had to be answered from the TIMESTAMPS instead. */
+  if (!r.ok) {
+    userRefreshFails.set(userId, (userRefreshFails.get(userId) || 0) + 1);
+    console.error(`refresh failed for user ${userId} (${userRefreshFails.get(userId)} so far):`, await r.text());
+    return null;
+  }
   const t = await r.json();
   const updated = {
     access_token: t.access_token,
@@ -535,7 +546,7 @@ async function sfServiceRefreshToken() {
     // enabling encryption later does not strand the row.
     const plain = isSealed(data.refresh_token)
       ? unseal(data.refresh_token, SF_SVC_SEAL_ID) : data.refresh_token;
-    if (!plain) { console.error("stored Salesforce service token could not be decrypted — TOKEN_ENC_KEY may have changed"); return null; }
+    if (!plain) { console.error(sealedReadError("stored Salesforce service refresh token", ENC_KEY)); return null; }
     return { refresh: plain, rotations: data.rotated_count || 0, instance: (data.meta && data.meta.instance) || "", seeded: false };
   }
   const boot = process.env.SF_SERVICE_REFRESH_TOKEN;

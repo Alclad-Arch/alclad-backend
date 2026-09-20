@@ -20,7 +20,7 @@
 //   3. The new refresh token is persisted BEFORE the access token is handed out. If the
 //      process dies between the two, the stored token is still the live one — losing an
 //      access token costs a refresh, losing the refresh token costs a browser re-approval.
-import { seal, unseal, isSealed, loadKey } from "./tokenCrypto.js";
+import { seal, unseal, isSealed, loadKey, sealedReadError } from "./tokenCrypto.js";
 
 const PROVIDER = "myob";
 // The AAD the token is sealed under. tokenCrypto binds an identifier into the ciphertext so a
@@ -64,7 +64,7 @@ async function readRefresh(db, cfg) {
     // A row written before TOKEN_ENC_KEY was set is plaintext; unseal only what is sealed, so
     // turning encryption on later does not strand the existing row.
     const plain = isSealed(stored) ? unseal(stored, SEAL_ID, cfg.encKey) : stored;
-    if (!plain) throw new Error("stored refresh token could not be decrypted — TOKEN_ENC_KEY may have changed");
+    if (!plain) throw new Error(sealedReadError("stored MYOB refresh token", cfg.encKey));
     return { refresh: plain, rotations: data.rotated_count || 0, seeded: false };
   }
 

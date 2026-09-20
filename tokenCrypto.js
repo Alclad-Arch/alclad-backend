@@ -49,3 +49,19 @@ export function unseal(value, userId, key) {
     return null;
   }
 }
+
+/* WHY A SEALED VALUE WOULD NOT OPEN — and there are two reasons, not one.
+ *
+ * Three call sites said "TOKEN_ENC_KEY may have changed" for both of them. loadKey() returns NULL
+ * when the variable is simply ABSENT, so running anything on a machine that has never held the key
+ * — a probe on a laptop, say — reported a changed key and read as production being broken, when
+ * production was fine and the shell was missing a value (Jed, 2026-09-21, probing ALX_JobAnalysis).
+ *
+ * One helper rather than three copies, because it was three copies that let two of them keep the
+ * old message after the first was fixed. `key` is the loaded key (or null) the caller tried with.
+ */
+export function sealedReadError(what, key) {
+  return key
+    ? `${what} could not be decrypted — the TOKEN_ENC_KEY in this environment does not open it, so it is not the key the row was sealed with`
+    : `${what} is SEALED and TOKEN_ENC_KEY is not set here — a local-shell problem, not a broken credential. Export the key this service uses, or run the command on the server.`;
+}
