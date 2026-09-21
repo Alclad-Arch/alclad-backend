@@ -31,6 +31,7 @@ import { loadKey, isSealed, seal as sealWith, unseal as unsealWith, sealedReadEr
 import { buildSummaryQuery, shapeSummary } from "./oppSummary.js";
 import { buildSearchQuery } from "./oppSearch.js";
 import { serialQueue } from "./serialQueue.js";
+import { sfGrantHealth, sfGrantUsable, sfGrantSummary, SF_IDLE_DAYS } from "./sfHealth.js";
 import { syncActuals } from "./syncMyobActuals.js";
 import { schedulerEnabled, startupJitterMs, CHECK_MS } from "./syncSchedule.js";
 
@@ -391,7 +392,26 @@ async function refreshSalesforceNow(userId, row) {
      diagnosis turned on, and it had to be answered from the TIMESTAMPS instead. */
   if (!r.ok) {
     userRefreshFails.set(userId, (userRefreshFails.get(userId) || 0) + 1);
-    console.error(`refresh failed for user ${userId} (${userRefreshFails.get(userId)} so far):`, await r.text());
+    const text = await r.text();
+    console.error(`refresh failed for user ${userId} (${userRefreshFails.get(userId)} so far):`, text);
+    /* ⚠ RECORD WHY, WHERE SOMEBODY CAN READ IT.
+       Jed 2026-09-21: a connection reads as live when it has actually expired. It does so because
+       /api/auth/status answers on the EXISTENCE of this row, and the row survives its grant dying.
+       The honest test is to use the token — but using it rotates it, so a health check cannot ask
+       Salesforce without damaging what it inspects. The outcome is therefore written down HERE, at
+       the one moment it is known for free, and every panel reads it instead of probing.
+       Salesforce's own words are kept: invalid_grant alone cannot tell revoked from expired from
+       IP-blocked, and only error_description can. */
+    let code = `HTTP ${r.status}`; let desc = "";
+    try { const j = JSON.parse(text); code = j.error || code; desc = j.error_description || ""; }
+    catch { desc = String(text || "").slice(0, 300); }
+    /* Best-effort: a failure to record the failure must not become a second failure. The refresh
+       has already failed and the caller's handling of that is what matters. */
+    try {
+      await supabaseAdmin.from("salesforce_tokens").update({
+        last_error: code, last_error_desc: desc, last_error_at: new Date().toISOString(),
+      }).eq("user_id", userId);
+    } catch (e) { console.error("could not record the refresh failure:", e && e.message); }
     return null;
   }
   const t = await r.json();
@@ -405,14 +425,85 @@ async function refreshSalesforceNow(userId, row) {
     ...updated,
     access_token: seal(updated.access_token, userId),
     refresh_token: seal(updated.refresh_token, userId),
+    /* CLEARED, not left behind. A stale error next to a fresh success reads as a broken grant to
+       anyone scanning the panel, and the whole point of this is that the panel stops lying. */
+    last_ok_at: updated.updated_at,
+    last_error: null, last_error_desc: null, last_error_at: null,
   }).eq("user_id", userId);
+  userRefreshFails.delete(userId);
   return updated;   // callers get the plaintext they need to make the call
 }
 
+
 // --- Auth status for the frontend ---
 app.get("/api/auth/status", requireUser, async (req, res) => {
-  const { data } = await supabaseAdmin.from("salesforce_tokens").select("user_id, sf_username").eq("user_id", req.userId).maybeSingle();
-  res.json({ authenticated: Boolean(data), username: data?.sf_username || null });
+  const { data } = await supabaseAdmin.from("salesforce_tokens")
+    .select("user_id, sf_username, updated_at, last_ok_at, last_error, last_error_desc, last_error_at")
+    .eq("user_id", req.userId).maybeSingle();
+  const health = sfGrantHealth(data);
+  /* ⚠ `authenticated` STILL MEANS "a row exists", and that is deliberate — it is what every
+     existing caller has always been told and silently changing its meaning would alter behaviour
+     nobody asked to change. What is NEW is `healthy`, which is the answer to the question people
+     were actually asking of it. Jed 2026-09-21: "you think you are connected when in fact your
+     connection has expired." src/salesforce.jsx:115 has carried a note about this since
+     2026-09-11; the fix is to publish the distinction rather than to blur it further. */
+  res.json({
+    authenticated: Boolean(data),
+    username: data?.sf_username || null,
+    healthy: sfGrantUsable(health),
+    /* ONE PLACE WRITES THE WORDS. The app renders this rather than composing its own sentence, so
+       the banner a user sees and the row an admin reads cannot describe one state differently —
+       and so a new state cannot be added without both surfaces gaining it. */
+    summary: sfGrantSummary(health),
+    ...health,
+  });
+});
+
+/* --- Who is connected, and whose connection has quietly died -------------------------------
+ *
+ * Jed 2026-09-21, asking for this in Platform Settings → Integrations: a connection can read as
+ * live long after it has expired, and nothing in the app has ever shown otherwise.
+ *
+ * ⚠ IT MAKES NO SALESFORCE CALLS. Not a limitation — the point. Verifying a refresh token means
+ * using it, using it rotates it, and rotating somebody else's grant to satisfy an admin's
+ * curiosity is how a diagnostic becomes the outage. Every field here was recorded when a real
+ * refresh happened. (The same trap was built into and removed from the service-account check.)
+ *
+ * ⚠ GATED ON ADMIN EXPLICITLY, not merely on requireUser. requireUser tests SF_ALLOWED_ROLES,
+ * which is "who may use Salesforce" — a list that could reasonably be widened to estimators one
+ * day, and that must not silently hand every estimator a roster of their colleagues' connection
+ * states. Two different questions, two different gates.
+ */
+app.get("/api/salesforce/connections", requireUser, async (req, res) => {
+  if (!["super_admin", "admin"].includes(req.userRole || "")) {
+    audit(req, "connections_denied", `role=${req.userRole || "(none)"}`, 403);
+    return res.status(403).json({ error: "Only an admin can see other users' connections" });
+  }
+  const { data: rows, error } = await supabaseAdmin.from("salesforce_tokens")
+    .select("user_id, sf_username, updated_at, last_ok_at, last_error, last_error_desc, last_error_at");
+  if (error) return res.status(503).json({ error: `Could not read the connections — ${error.message}` });
+
+  /* Names, so the list is readable. user_profiles is read with the service-role key, which is the
+     only thing that can: its RLS is read-your-own-row, so a browser could never assemble this
+     itself — which is also why it has to come through the backend rather than straight from
+     Supabase. A profile that is missing is not an error; the row still counts, it is just
+     unnamed, and dropping it would hide a connection rather than report it. */
+  const ids = (rows || []).map((r) => r.user_id);
+  let names = {};
+  if (ids.length) {
+    const { data: profs } = await supabaseAdmin.from("user_profiles").select("id, display_name, role").in("id", ids);
+    names = Object.fromEntries((profs || []).map((p) => [p.id, p]));
+  }
+  res.json({
+    idleDays: SF_IDLE_DAYS,
+    connections: (rows || []).map((r) => ({
+      userId: r.user_id,
+      name: (names[r.user_id] && names[r.user_id].display_name) || null,
+      role: (names[r.user_id] && names[r.user_id].role) || null,
+      lastRefreshed: r.updated_at || null,
+      ...(() => { const h = sfGrantHealth(r); return { ...h, usable: sfGrantUsable(h), summary: sfGrantSummary(h) }; })(),
+    })),
+  });
 });
 
 // --- Disconnect: revoke at Salesforce, then forget the tokens ---
