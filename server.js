@@ -30,6 +30,7 @@ import { createClient } from "@supabase/supabase-js";
 import { loadKey, isSealed, seal as sealWith, unseal as unsealWith, sealedReadError } from "./tokenCrypto.js";
 import { buildSummaryQuery, shapeSummary } from "./oppSummary.js";
 import { buildSearchQuery } from "./oppSearch.js";
+import { buildReviewQueries, buildPriorQueries, shapeRecord } from "./oppReview.js";
 import { serialQueue } from "./serialQueue.js";
 import { sfGrantHealth, sfGrantUsable, sfGrantSummary, SF_IDLE_DAYS } from "./sfHealth.js";
 import { syncActuals } from "./syncMyobActuals.js";
@@ -950,6 +951,91 @@ app.get("/api/salesforce/opportunity-search", requireUser, rateLimit({ perMin: R
     console.error("opportunity-search error:", e && e.name, e && e.message);
     audit(req, "opp_search_error", `${q.term} — ${e && e.name}`, 502);
     res.status(502).json({ error: "Salesforce search failed" });
+  }
+});
+
+// Reva AI's read of Salesforce for ONE BUDGET — see oppReview.js for why it is shaped like this.
+//
+// Jed 2026-10-28 chose this over a Salesforce licence for her. Who may call it is its own list,
+// SF_REVIEW_ROLES (default: the review agents' role and super admins, so it can be checked by
+// hand) — NOT SF_ALLOWED_ROLES, which answers "who may use Salesforce" for people. The caller names
+// a budget; the opportunities are the ones that budget's job is linked to on the Projects hub
+// (pm_package_opportunities), found here with the service role. Read-only, service account only.
+const REVIEW_ROLES = (process.env.SF_REVIEW_ROLES || "ai_agent_review,super_admin").split(",").map((s) => s.trim()).filter(Boolean);
+const BUDGET_ID = /^[A-Za-z0-9_-]{1,80}$/;
+const linkIds = (v) => (Array.isArray(v) ? v : v == null || v === "" ? [] : [v]).map((x) => String(x));
+
+app.get("/api/salesforce/opportunity-review", requireSession, rateLimit({ perMin: RATE_PER_MIN, perDay: RATE_PER_DAY, action: "opp_review" }), async (req, res) => {
+  const { data: prof, error: pErr } = await supabaseAdmin.from("user_profiles").select("role").eq("id", req.userId).maybeSingle();
+  if (pErr) return res.status(503).json({ error: "Could not check permissions" });
+  const role = (prof && prof.role) || "";
+  if (!REVIEW_ROLES.includes(role)) {
+    audit(req, "opp_review_denied", `role=${role || "(none)"}`, 403);
+    return res.status(403).json({ error: "Only the review agent can use this Salesforce feed" });
+  }
+  const budget = String(req.query.budget || "").trim();
+  if (!BUDGET_ID.test(budget)) return res.status(400).json({ error: "Name a budget (its id)" });
+
+  try {
+    // the budget → its hub job: its own pm_project_id, else the hub job whose links.budget names it
+    const { data: b, error: bErr } = await supabaseAdmin.from("cb_projects").select("id, name, pm_project_id").eq("id", budget).maybeSingle();
+    if (bErr) return res.status(503).json({ error: "Could not read the budget" });
+    if (!b) return res.status(404).json({ error: "No such budget" });
+    let hubId = b.pm_project_id || null;
+    if (!hubId) {
+      const { data: hubs } = await supabaseAdmin.from("pm_projects").select("id, links");
+      const h = (hubs || []).find((x) => x && x.links && linkIds(x.links.budget).includes(budget));
+      hubId = h ? h.id : null;
+    }
+    if (!hubId) return res.json({ budget: { id: b.id, name: b.name }, linked: false, reason: "This budget is not linked to a job on the Projects hub, so it has no Salesforce opportunities." });
+    const { data: pk } = await supabaseAdmin.from("pm_package_opportunities").select("scope, sf_opportunity_id, sf_opportunity_number, sf_opportunity_name").eq("pm_project_id", hubId);
+    const packages = (pk || []).filter((p) => p && p.sf_opportunity_id);
+    const q = buildReviewQueries(packages.map((p) => p.sf_opportunity_id));
+    if (!q) return res.json({ budget: { id: b.id, name: b.name }, linked: false, reason: "None of the job's packages is linked to a Salesforce opportunity on the Projects hub." });
+
+    // service account only — an agent has no personal grant
+    let svc = await serviceToken(false);
+    if (!svc) return res.status(503).json({ error: "Salesforce service account unavailable" });
+    const call = (soql) => fetch(`${svc.instance_url}/services/data/v60.0/query?q=${encodeURIComponent(soql)}`,
+      { method: "GET", headers: { Authorization: `Bearer ${svc.access_token}`, "Content-Type": "application/json" }, signal: AbortSignal.timeout(SF_TIMEOUT_MS) });
+    /* Try each field set in turn: a 400 is an unreadable field (drop to the plainer set), a 401 is a
+       stale cached token (refresh once). Returns the records, or { error } for that one read so a
+       missing EmailMessage permission costs the emails, not the review. */
+    const read = async (soqls) => {
+      for (const soql of soqls) {
+        let r = await call(soql);
+        if (r.status === 401) {
+          const fresh = await serviceToken(true);
+          if (!fresh) return { error: "service account unavailable" };
+          svc = fresh; r = await call(soql);
+        }
+        if (r.ok) { const d = await r.json(); return { records: (d.records || []).map(shapeRecord) }; }
+        if (r.status !== 400) return { error: `Salesforce answered ${r.status}` };
+      }
+      return { error: "no readable field set" };
+    };
+    const opp = await read(q.opportunity);
+    if (opp.error) {
+      audit(req, "opp_review_failed", `${budget} — ${opp.error}`, 502);
+      return res.status(502).json({ error: "Salesforce could not answer: " + opp.error });
+    }
+    const [tasks, emails] = await Promise.all([read(q.tasks), read(q.emails)]);
+    const accounts = [...new Set(opp.records.map((o) => o.AccountId).filter(Boolean))];
+    const priorQ = buildPriorQueries(accounts, q.ids);
+    const prior = priorQ ? await read(priorQ) : { records: [] };
+    audit(req, "opp_review", `${budget} — ${opp.records.length} opp(s)`, 200);
+    res.json({
+      budget: { id: b.id, name: b.name }, linked: true, viaService: true,
+      packages: packages.map((p) => ({ scope: p.scope, id: p.sf_opportunity_id, number: p.sf_opportunity_number, name: p.sf_opportunity_name })),
+      opportunities: opp.records,
+      tasks: tasks.records || [], tasksError: tasks.error || null,
+      emails: emails.records || [], emailsError: emails.error || null,
+      prior: prior.records || [], priorError: prior.error || null,
+    });
+  } catch (e) {
+    console.error("opportunity-review error:", e && e.name, e && e.message);
+    audit(req, "opp_review_error", `${budget} — ${e && e.name}`, 502);
+    res.status(502).json({ error: "Salesforce request failed" });
   }
 });
 
