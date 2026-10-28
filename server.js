@@ -30,7 +30,7 @@ import { createClient } from "@supabase/supabase-js";
 import { loadKey, isSealed, seal as sealWith, unseal as unsealWith, sealedReadError } from "./tokenCrypto.js";
 import { buildSummaryQuery, shapeSummary } from "./oppSummary.js";
 import { buildSearchQuery } from "./oppSearch.js";
-import { buildReviewQueries, buildPriorQueries, shapeRecord } from "./oppReview.js";
+import { buildReviewQueries, buildPriorQueries, shapeRecord, budgetOpportunities } from "./oppReview.js";
 import { serialQueue } from "./serialQueue.js";
 import { sfGrantHealth, sfGrantUsable, sfGrantSummary, SF_IDLE_DAYS } from "./sfHealth.js";
 import { syncActuals } from "./syncMyobActuals.js";
@@ -977,21 +977,36 @@ app.get("/api/salesforce/opportunity-review", requireSession, rateLimit({ perMin
   if (!BUDGET_ID.test(budget)) return res.status(400).json({ error: "Name a budget (its id)" });
 
   try {
-    // the budget → its hub job: its own pm_project_id, else the hub job whose links.budget names it
-    const { data: b, error: bErr } = await supabaseAdmin.from("cb_projects").select("id, name, pm_project_id").eq("id", budget).maybeSingle();
+    // the budget, and its takeoff (extra.dtProjectId) — the app finds a budget's deals through both
+    const { data: b, error: bErr } = await supabaseAdmin.from("cb_projects").select("id, name, pm_project_id, extra").eq("id", budget).maybeSingle();
     if (bErr) return res.status(503).json({ error: "Could not read the budget" });
     if (!b) return res.status(404).json({ error: "No such budget" });
+    const extra = (b.extra && typeof b.extra === "object") ? b.extra : {};
+    const takeoffId = typeof extra.dtProjectId === "string" ? extra.dtProjectId : null;
+    let takeoff = null;
+    if (takeoffId) {
+      const { data: t } = await supabaseAdmin.from("est_pto_projects").select("id, pm_project_id, data").eq("id", takeoffId).maybeSingle();
+      takeoff = t || null;
+    }
+    // its hub job: its own pm_project_id, else the hub job whose links.budget names it, else its takeoff's
     let hubId = b.pm_project_id || null;
     if (!hubId) {
       const { data: hubs } = await supabaseAdmin.from("pm_projects").select("id, links");
       const h = (hubs || []).find((x) => x && x.links && linkIds(x.links.budget).includes(budget));
       hubId = h ? h.id : null;
     }
-    if (!hubId) return res.json({ budget: { id: b.id, name: b.name }, linked: false, reason: "This budget is not linked to a job on the Projects hub, so it has no Salesforce opportunities." });
-    const { data: pk } = await supabaseAdmin.from("pm_package_opportunities").select("scope, sf_opportunity_id, sf_opportunity_number, sf_opportunity_name").eq("pm_project_id", hubId);
-    const packages = (pk || []).filter((p) => p && p.sf_opportunity_id);
-    const q = buildReviewQueries(packages.map((p) => p.sf_opportunity_id));
-    if (!q) return res.json({ budget: { id: b.id, name: b.name }, linked: false, reason: "None of the job's packages is linked to a Salesforce opportunity on the Projects hub." });
+    if (!hubId && takeoff && takeoff.pm_project_id) hubId = takeoff.pm_project_id;
+    let hubPackages = [];
+    if (hubId) {
+      const { data: pk } = await supabaseAdmin.from("pm_package_opportunities").select("scope, sf_opportunity_id, sf_opportunity_number, sf_opportunity_name").eq("pm_project_id", hubId);
+      hubPackages = (pk || []).filter((p) => p && p.sf_opportunity_id);
+    }
+    const found = budgetOpportunities({ hubPackages, hubId, budgetOpp: extra.sfOpp || null,
+      takeoffOpp: takeoff && takeoff.data && typeof takeoff.data === "object" ? takeoff.data.sfOpp || null : null });
+    const links = { budgetHub: b.pm_project_id || null, hub: hubId, takeoff: takeoffId, takeoffHub: (takeoff && takeoff.pm_project_id) || null };
+    const packages = found.packages;
+    const q = buildReviewQueries(packages.map((p) => p.id));
+    if (!q) return res.json({ budget: { id: b.id, name: b.name }, linked: false, links, reason: found.reason });
 
     // service account only — an agent has no personal grant
     let svc = await serviceToken(false);
@@ -1026,7 +1041,7 @@ app.get("/api/salesforce/opportunity-review", requireSession, rateLimit({ perMin
     audit(req, "opp_review", `${budget} — ${opp.records.length} opp(s)`, 200);
     res.json({
       budget: { id: b.id, name: b.name }, linked: true, viaService: true,
-      packages: packages.map((p) => ({ scope: p.scope, id: p.sf_opportunity_id, number: p.sf_opportunity_number, name: p.sf_opportunity_name })),
+      links, packages,   // each package says where it was found: hub, budget or takeoff
       opportunities: opp.records,
       tasks: tasks.records || [], tasksError: tasks.error || null,
       emails: emails.records || [], emailsError: emails.error || null,

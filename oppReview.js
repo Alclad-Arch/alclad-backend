@@ -55,6 +55,32 @@ export function cleanIds(ids) {
 
 const inList = (ids) => ids.map((id) => `'${id}'`).join(", ");
 
+/* WHICH OPPORTUNITIES A BUDGET ANSWERS TO — the same three places the app reads, in its order
+   (Jed 2026-10-29: Reva said "not linked to a job on the Projects hub" for a budget Bridget had built
+   from a hub-linked takeoff; the feed only followed the budget's OWN hub link):
+     1. the hub job's packages (pm_package_opportunities) — the hub job being the budget's own
+        pm_project_id, else the hub job whose links.budget names it, else its takeoff's hub job;
+     2. the opportunity stamped on the budget (cb_projects.extra.sfOpp — the Estimating hub's New
+        Project stamps it);
+     3. the opportunity on its takeoff (est_pto_projects.data.sfOpp, via extra.dtProjectId).
+   Duplicates are dropped (first place wins), every id is validated before it is used, and `reason`
+   says plainly why there is nothing when there is nothing. Still only ever this budget's deals. */
+export function budgetOpportunities({ hubPackages = [], budgetOpp = null, takeoffOpp = null, hubId = null } = {}) {
+  const out = [];
+  const add = (scope, o, source) => {
+    const id = String((o && (o.id || o.sf_opportunity_id)) || "").trim();
+    if (!SF_ID.test(id) || out.some((x) => x.id === id) || out.length >= MAX_OPPS) return;
+    out.push({ scope: scope || "", id, number: (o.number || o.sf_opportunity_number || "") || "", name: (o.name || o.sf_opportunity_name || "") || "", source });
+  };
+  for (const p of hubPackages || []) add(p && p.scope, p, "hub");
+  if (budgetOpp) add("", budgetOpp, "budget");
+  if (takeoffOpp) add("", takeoffOpp, "takeoff");
+  if (out.length) return { packages: out };
+  return { packages: [], reason: hubId
+    ? "No Salesforce opportunity is linked to this budget: its hub job's packages have none, and neither the budget nor its takeoff is stamped with one."
+    : "No Salesforce opportunity is linked to this budget: it isn't linked to a job on the Projects hub (directly or through its takeoff), and neither the budget nor its takeoff is stamped with one." };
+}
+
 /* The four reads, each a list of SOQL strings to try in order. `accountIds` come back from the
    first read (Salesforce's own answer, validated again here). */
 export function buildReviewQueries(oppIds) {

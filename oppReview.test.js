@@ -4,7 +4,7 @@
 // matters: only validated Salesforce ids, only fixed field lists.
 import assert from "node:assert/strict";
 import test from "node:test";
-import { cleanIds, buildReviewQueries, buildPriorQueries, shapeRecord, MAX_OPPS, TEXT_MAX } from "./oppReview.js";
+import { cleanIds, buildReviewQueries, buildPriorQueries, shapeRecord, budgetOpportunities, MAX_OPPS, TEXT_MAX } from "./oppReview.js";
 
 const A = "0065g00000AbCdEAAZ", B = "0065g00000XyZwvAAA";
 
@@ -55,4 +55,31 @@ test("records come back as plain JSON: no attributes, relations flattened, HTML 
   assert.equal(r.Description_Rich__c.trim(), "Supply & install\nExcl. spotting");
   assert.ok(r.TextBody.endsWith("…(trimmed)") && r.TextBody.length < TEXT_MAX + 20);
   assert.equal(r.Amount, 125000);
+});
+
+// ── which opportunities a budget answers to: the app's three places (Jed 2026-10-29) ──────────
+const C = "0065g00000ClAdDAAA";
+test("the hub job's packages, with their scopes", () => {
+  const r = budgetOpportunities({ hubId: "h1", hubPackages: [{ scope: "Glazing", sf_opportunity_id: A, sf_opportunity_number: "7279" }, { scope: "Cladding", sf_opportunity_id: B, sf_opportunity_number: "7282" }] });
+  assert.deepEqual(r.packages.map((p) => [p.scope, p.id, p.number, p.source]), [["Glazing", A, "7279", "hub"], ["Cladding", B, "7282", "hub"]]);
+  assert.equal(r.reason, undefined);
+});
+test("a budget with NO hub link still finds the opportunity stamped on it (Reva's Power St budget)", () => {
+  const r = budgetOpportunities({ hubId: null, budgetOpp: { id: A, number: "7701", name: "MAB" } });
+  assert.deepEqual(r.packages.map((p) => [p.id, p.source]), [[A, "budget"]]);
+});
+test("…or the one on its takeoff", () => {
+  assert.deepEqual(budgetOpportunities({ takeoffOpp: { id: C, number: "7702" } }).packages.map((p) => [p.id, p.source]), [[C, "takeoff"]]);
+});
+test("the same deal in two places counts once — the hub's wins", () => {
+  const r = budgetOpportunities({ hubId: "h1", hubPackages: [{ scope: "Glazing", sf_opportunity_id: A }], budgetOpp: { id: A }, takeoffOpp: { id: A } });
+  assert.equal(r.packages.length, 1);
+  assert.equal(r.packages[0].source, "hub");
+});
+test("⚠ a stamp that isn't a Salesforce id is ignored, never quoted into SOQL", () => {
+  assert.equal(budgetOpportunities({ budgetOpp: { id: "x' OR Id != '" } }).packages.length, 0);
+});
+test("nothing anywhere: a reason that says where it looked", () => {
+  assert.match(budgetOpportunities({}).reason, /isn't linked to a job on the Projects hub \(directly or through its takeoff\)/);
+  assert.match(budgetOpportunities({ hubId: "h1" }).reason, /its hub job's packages have none/);
 });
