@@ -1,22 +1,20 @@
-// The daily markup review — run by a Render Cron Job, early each morning.
+// The daily markup review — run each morning by GitHub Actions (.github/workflows/daily-markup-review.yml).
 //
 // Jed 2026-10-29 (Eric's markup-review skill, "use the Render cron"): once a day, compare every
 // newly Complete takeoff page's agent markups with what people confirmed, record the outcomes, file
 // the suggestions, and start Eric AI to write the proposed wording. All of that happens in alclad.app's
 // `agents` edge function (supabase/functions/agents, action "daily review"); this only knocks on its
-// door with the shared secret, says what came back, and exits non-zero on a failure so Render's
-// cron history shows it.
+// door with the shared secret, says what came back, and exits non-zero on a failure so the
+// workflow's run history shows it.
 //
-// WHY A CRON JOB AND NOT A TIMER IN server.js: the web service is on a plan that sleeps when idle,
-// so an in-process timer at 4am would wake to find nobody had called it (see syncSchedule.js on the
-// free tier). A Render Cron Job is its own short-lived process, started on schedule whether or not
-// the web service is awake.
+// WHY NOT A TIMER IN server.js: the web service sleeps when idle, so an in-process timer at 4am would
+// wake to find nobody had called it (see syncSchedule.js). A scheduled job is its own short-lived
+// process. It was to be a Render Cron Job; Render wants a card on file for those, so it is GitHub
+// Actions — the same script either way.
 //
-// Render → New → Cron Job, this repo:
-//   Command   node dailyMarkupReview.js
-//   Schedule  0 18 * * *        (18:00 UTC = 4am in Melbourne at AEST, 5am at AEDT)
-//   Env       AGENTS_FUNCTION_URL  https://<project ref>.supabase.co/functions/v1/agents
-//             AGENTS_REVIEW_SECRET the same value as the agents function's AGENTS_REVIEW_SECRET secret
+// The workflow, at 18:00 UTC (4am in Melbourne at AEST, 5am at AEDT), reads two repository secrets:
+//   AGENTS_FUNCTION_URL   https://<project ref>.supabase.co/functions/v1/agents
+//   AGENTS_REVIEW_SECRET  the same value as the agents function's AGENTS_REVIEW_SECRET secret
 //
 // Run by hand: AGENTS_FUNCTION_URL=… AGENTS_REVIEW_SECRET=… node dailyMarkupReview.js
 import "dotenv/config";

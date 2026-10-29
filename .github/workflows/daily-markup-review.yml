@@ -1,0 +1,41 @@
+# The daily markup review (Jed 2026-10-29): each morning, ask alclad.app's agents function to compare
+# newly Complete takeoff pages' agent markups with what people confirmed, file suggestions, and start
+# Eric to word them. See dailyMarkupReview.js.
+#
+# GitHub Actions rather than a Render Cron Job: Render wants a card on file for cron jobs.
+#
+# Repo → Settings → Secrets and variables → Actions → New repository secret:
+#   AGENTS_FUNCTION_URL   https://<prod project ref>.supabase.co/functions/v1/agents
+#   AGENTS_REVIEW_SECRET  the same value as the agents function's AGENTS_REVIEW_SECRET on prod
+#
+# Run it by hand: Actions → Daily markup review → Run workflow.
+name: Daily markup review
+
+on:
+  schedule:
+    - cron: '0 18 * * *'   # 18:00 UTC = 4am Melbourne (AEST), 5am (AEDT). GitHub may start it a little late.
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-markup-review
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --omit=dev
+      - name: Run the review
+        run: node dailyMarkupReview.js
+        env:
+          AGENTS_FUNCTION_URL: ${{ secrets.AGENTS_FUNCTION_URL }}
+          AGENTS_REVIEW_SECRET: ${{ secrets.AGENTS_REVIEW_SECRET }}
