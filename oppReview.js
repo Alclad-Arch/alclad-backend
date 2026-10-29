@@ -65,7 +65,7 @@ const inList = (ids) => ids.map((id) => `'${id}'`).join(", ");
      3. the opportunity on its takeoff (est_pto_projects.data.sfOpp, via extra.dtProjectId).
    Duplicates are dropped (first place wins), every id is validated before it is used, and `reason`
    says plainly why there is nothing when there is nothing. Still only ever this budget's deals. */
-export function budgetOpportunities({ hubPackages = [], budgetOpp = null, takeoffOpp = null, hubId = null } = {}) {
+export function budgetOpportunities({ hubPackages = [], budgetOpp = null, takeoffOpp = null, hubId = null, subject = "budget" } = {}) {
   const out = [];
   const add = (scope, o, source) => {
     const id = String((o && (o.id || o.sf_opportunity_id)) || "").trim();
@@ -76,6 +76,11 @@ export function budgetOpportunities({ hubPackages = [], budgetOpp = null, takeof
   if (budgetOpp) add("", budgetOpp, "budget");
   if (takeoffOpp) add("", takeoffOpp, "takeoff");
   if (out.length) return { packages: out };
+  /* Scott AI asks by TAKEOFF (2026-10-29): he scopes a job before any budget exists, so the same
+     three places are read from the takeoff's side — its hub job, a budget built from it, itself. */
+  if (subject === "takeoff") return { packages: [], reason: hubId
+    ? "No Salesforce opportunity is linked to this takeoff: its hub job's packages have none, and neither the takeoff nor a budget built from it is stamped with one."
+    : "No Salesforce opportunity is linked to this takeoff: it isn't linked to a job on the Projects hub, and neither the takeoff nor a budget built from it is stamped with one." };
   return { packages: [], reason: hubId
     ? "No Salesforce opportunity is linked to this budget: its hub job's packages have none, and neither the budget nor its takeoff is stamped with one."
     : "No Salesforce opportunity is linked to this budget: it isn't linked to a job on the Projects hub (directly or through its takeoff), and neither the budget nor its takeoff is stamped with one." };

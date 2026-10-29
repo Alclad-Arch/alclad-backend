@@ -955,13 +955,16 @@ app.get("/api/salesforce/opportunity-search", requireUser, rateLimit({ perMin: R
 });
 
 // Reva AI's read of Salesforce for ONE BUDGET — see oppReview.js for why it is shaped like this.
+// Scott AI (2026-10-29) reads the same feed for ONE TAKEOFF (?takeoff=<est id>): he scopes a job
+// before any budget exists. His role is on the default list; if SF_REVIEW_ROLES is set on the host,
+// ai_agent_scope must be added there too.
 //
 // Jed 2026-10-28 chose this over a Salesforce licence for her. Who may call it is its own list,
 // SF_REVIEW_ROLES (default: the review agents' role and super admins, so it can be checked by
 // hand) — NOT SF_ALLOWED_ROLES, which answers "who may use Salesforce" for people. The caller names
 // a budget; the opportunities are the ones that budget's job is linked to on the Projects hub
 // (pm_package_opportunities), found here with the service role. Read-only, service account only.
-const REVIEW_ROLES = (process.env.SF_REVIEW_ROLES || "ai_agent_review,super_admin").split(",").map((s) => s.trim()).filter(Boolean);
+const REVIEW_ROLES = (process.env.SF_REVIEW_ROLES || "ai_agent_review,ai_agent_scope,super_admin").split(",").map((s) => s.trim()).filter(Boolean);
 const BUDGET_ID = /^[A-Za-z0-9_-]{1,80}$/;
 const linkIds = (v) => (Array.isArray(v) ? v : v == null || v === "" ? [] : [v]).map((x) => String(x));
 
@@ -974,7 +977,12 @@ app.get("/api/salesforce/opportunity-review", requireSession, rateLimit({ perMin
     return res.status(403).json({ error: "Only the review agent can use this Salesforce feed" });
   }
   const budget = String(req.query.budget || "").trim();
-  if (!BUDGET_ID.test(budget)) return res.status(400).json({ error: "Name a budget (its id)" });
+  const takeoffQ = String(req.query.takeoff || "").trim();
+  if (!budget && takeoffQ) {
+    if (!BUDGET_ID.test(takeoffQ)) return res.status(400).json({ error: "Name a takeoff (its id)" });
+    return takeoffReview(req, res, takeoffQ);
+  }
+  if (!BUDGET_ID.test(budget)) return res.status(400).json({ error: "Name a budget (its id), or a takeoff" });
 
   try {
     // the budget, and its takeoff (extra.dtProjectId) — the app finds a budget's deals through both
@@ -1004,9 +1012,52 @@ app.get("/api/salesforce/opportunity-review", requireSession, rateLimit({ perMin
     const found = budgetOpportunities({ hubPackages, hubId, budgetOpp: extra.sfOpp || null,
       takeoffOpp: takeoff && takeoff.data && typeof takeoff.data === "object" ? takeoff.data.sfOpp || null : null });
     const links = { budgetHub: b.pm_project_id || null, hub: hubId, takeoff: takeoffId, takeoffHub: (takeoff && takeoff.pm_project_id) || null };
+    return await answerReview(req, res, { budget: { id: b.id, name: b.name } }, budget, found, links);
+  } catch (e) {
+    console.error("opportunity-review error:", e && e.name, e && e.message);
+    audit(req, "opp_review_error", `${budget} — ${e && e.name}`, 502);
+    res.status(502).json({ error: "Salesforce request failed" });
+  }
+});
+
+/* The takeoff's deals: its hub job (its own pm_project_id, else the hub job whose links.dt names
+   it), a budget built from it (cb_projects.extra.dtProjectId), and the takeoff's own stamp. */
+async function takeoffReview(req, res, takeoffId) {
+  try {
+    const { data: t, error: tErr } = await supabaseAdmin.from("est_pto_projects").select("id, pm_project_id, data").eq("id", takeoffId).maybeSingle();
+    if (tErr) return res.status(503).json({ error: "Could not read the takeoff" });
+    if (!t) return res.status(404).json({ error: "No such takeoff" });
+    let hubId = t.pm_project_id || null;
+    if (!hubId) {
+      const { data: hubs } = await supabaseAdmin.from("pm_projects").select("id, links");
+      const h = (hubs || []).find((x) => x && x.links && linkIds(x.links.dt).includes(takeoffId));
+      hubId = h ? h.id : null;
+    }
+    let hubPackages = [];
+    if (hubId) {
+      const { data: pk } = await supabaseAdmin.from("pm_package_opportunities").select("scope, sf_opportunity_id, sf_opportunity_number, sf_opportunity_name").eq("pm_project_id", hubId);
+      hubPackages = (pk || []).filter((p) => p && p.sf_opportunity_id);
+    }
+    const { data: bs } = await supabaseAdmin.from("cb_projects").select("id, extra").eq("extra->>dtProjectId", takeoffId).limit(5);
+    const stamped = (bs || []).find((x) => x && x.extra && x.extra.sfOpp);
+    const data = t.data && typeof t.data === "object" ? t.data : {};
+    const found = budgetOpportunities({ hubPackages, hubId, subject: "takeoff",
+      budgetOpp: stamped ? stamped.extra.sfOpp : null, takeoffOpp: data.sfOpp || null });
+    const links = { takeoffHub: t.pm_project_id || null, hub: hubId, budgets: (bs || []).map((x) => x.id) };
+    return await answerReview(req, res, { takeoff: { id: t.id, name: String(data.name || "") } }, takeoffId, found, links);
+  } catch (e) {
+    console.error("opportunity-review (takeoff) error:", e && e.name, e && e.message);
+    audit(req, "opp_review_error", `${takeoffId} — ${e && e.name}`, 502);
+    res.status(502).json({ error: "Salesforce request failed" });
+  }
+}
+
+/* Read the found opportunities through the service account and answer — shared by the budget and
+   takeoff forms of the feed. `subject` is { budget } or { takeoff }; `label` names it in the audit. */
+async function answerReview(req, res, subject, label, found, links) {
     const packages = found.packages;
     const q = buildReviewQueries(packages.map((p) => p.id));
-    if (!q) return res.json({ budget: { id: b.id, name: b.name }, linked: false, links, reason: found.reason });
+    if (!q) return res.json({ ...subject, linked: false, links, reason: found.reason });
 
     // service account only — an agent has no personal grant
     let svc = await serviceToken(false);
@@ -1031,28 +1082,23 @@ app.get("/api/salesforce/opportunity-review", requireSession, rateLimit({ perMin
     };
     const opp = await read(q.opportunity);
     if (opp.error) {
-      audit(req, "opp_review_failed", `${budget} — ${opp.error}`, 502);
+      audit(req, "opp_review_failed", `${label} — ${opp.error}`, 502);
       return res.status(502).json({ error: "Salesforce could not answer: " + opp.error });
     }
     const [tasks, emails] = await Promise.all([read(q.tasks), read(q.emails)]);
     const accounts = [...new Set(opp.records.map((o) => o.AccountId).filter(Boolean))];
     const priorQ = buildPriorQueries(accounts, q.ids);
     const prior = priorQ ? await read(priorQ) : { records: [] };
-    audit(req, "opp_review", `${budget} — ${opp.records.length} opp(s)`, 200);
+    audit(req, "opp_review", `${label} — ${opp.records.length} opp(s)`, 200);
     res.json({
-      budget: { id: b.id, name: b.name }, linked: true, viaService: true,
+      ...subject, linked: true, viaService: true,
       links, packages,   // each package says where it was found: hub, budget or takeoff
       opportunities: opp.records,
       tasks: tasks.records || [], tasksError: tasks.error || null,
       emails: emails.records || [], emailsError: emails.error || null,
       prior: prior.records || [], priorError: prior.error || null,
     });
-  } catch (e) {
-    console.error("opportunity-review error:", e && e.name, e && e.message);
-    audit(req, "opp_review_error", `${budget} — ${e && e.name}`, 502);
-    res.status(502).json({ error: "Salesforce request failed" });
-  }
-});
+}
 
 app.get("/api/salesforce/*splat", requireUser, rateLimit({ perMin: RATE_PER_MIN, perDay: RATE_PER_DAY, action: "proxy" }), async (req, res) => {
   const sfPath = req.originalUrl.replace(/^\/api\/salesforce\//i, "");   // strip prefix, keep path + query

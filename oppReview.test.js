@@ -83,3 +83,17 @@ test("nothing anywhere: a reason that says where it looked", () => {
   assert.match(budgetOpportunities({}).reason, /isn't linked to a job on the Projects hub \(directly or through its takeoff\)/);
   assert.match(budgetOpportunities({ hubId: "h1" }).reason, /its hub job's packages have none/);
 });
+
+// Scott AI asks by TAKEOFF (2026-10-29): same places, worded for the takeoff when there is nothing
+test("takeoff subject: nothing linked says so about the takeoff, not a budget", () => {
+  const none = budgetOpportunities({ hubId: null, subject: "takeoff" });
+  assert.equal(none.packages.length, 0);
+  assert.match(none.reason, /linked to this takeoff: it isn't linked to a job on the Projects hub/);
+  assert.match(budgetOpportunities({ hubId: "h1", subject: "takeoff" }).reason, /this takeoff: its hub job's packages have none/);
+  assert.match(budgetOpportunities({ hubId: null }).reason, /linked to this budget/);   // the budget form is unchanged
+});
+test("takeoff subject: a budget built from it counts, as does its own stamp", () => {
+  const A = "006Ab00000ABCDEFGH", C = "006Ab00000ZZZZZZZZ";
+  const r = budgetOpportunities({ subject: "takeoff", budgetOpp: { id: A, number: "7701" }, takeoffOpp: { id: C } });
+  assert.deepEqual(r.packages.map((p) => [p.id, p.source]), [[A, "budget"], [C, "takeoff"]]);
+});
