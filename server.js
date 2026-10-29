@@ -31,6 +31,7 @@ import { loadKey, isSealed, seal as sealWith, unseal as unsealWith, sealedReadEr
 import { buildSummaryQuery, shapeSummary } from "./oppSummary.js";
 import { buildSearchQuery } from "./oppSearch.js";
 import { buildReviewQueries, buildPriorQueries, shapeRecord, budgetOpportunities } from "./oppReview.js";
+import { checkChanges, compositeRequest, readComposite } from "./salWrites.js";
 import { serialQueue } from "./serialQueue.js";
 import { sfGrantHealth, sfGrantUsable, sfGrantSummary, SF_IDLE_DAYS } from "./sfHealth.js";
 import { syncActuals } from "./syncMyobActuals.js";
@@ -1099,6 +1100,82 @@ async function answerReview(req, res, subject, label, found, links) {
       prior: prior.records || [], priorError: prior.error || null,
     });
 }
+
+/* SAL, the sales assistant (2026-10-29). Everything here runs as the CALLER, through their own
+   Salesforce connection — Jed: "history shows their name". Sal's chat (the `sal` edge function)
+   forwards the person's own login token, so these see exactly what that person sees.
+   /sal/me  — who they are in Salesforce (user id, name, time zone): Sal's getUserInfo.
+   /sal/apply — the change set the person said yes to, checked against salWrites.js and sent as ONE
+                all-or-nothing composite request. { dryRun: true } only checks it. */
+async function sfAsUser(req, res) {
+  const { data: raw } = await supabaseAdmin.from("salesforce_tokens").select("*").eq("user_id", req.userId).maybeSingle();
+  if (!raw) { res.status(401).json({ error: "Not connected to Salesforce — connect in alclad.app Settings → Connections" }); return null; }
+  const row = openRow(raw, req.userId);
+  if (!row) { res.status(401).json({ error: "Stored Salesforce credentials could not be read — reconnect in Settings → Connections" }); return null; }
+  // one call with a refresh-and-retry on an expired token
+  const call = async (path, init = {}) => {
+    const go = (r0) => fetch(`${r0.instance_url}${path}`, { ...init, headers: { Authorization: `Bearer ${r0.access_token}`, "Content-Type": "application/json" }, signal: AbortSignal.timeout(SF_TIMEOUT_MS) });
+    let r = await go(row);
+    if (r.status === 401) {
+      const fresh = await refreshSalesforce(req.userId, row);
+      if (!fresh) return { status: 401, json: { error: "Salesforce session expired — reconnect in Settings → Connections" } };
+      Object.assign(row, fresh);
+      r = await go(row);
+    }
+    const t = await r.text();
+    let j = null; try { j = t ? JSON.parse(t) : null; } catch { j = { error: t.slice(0, 300) }; }
+    return { status: r.status, json: j };
+  };
+  call.username = raw.sf_username || null;
+  return call;
+}
+/* who the caller is in Salesforce: the userinfo endpoint (needs the openid scope), else their User
+   row by the username stored when they connected */
+async function sfMe(call) {
+  const u = await call("/services/oauth2/userinfo");
+  if (u.status === 200 && u.json && u.json.user_id) return { userId: u.json.user_id, name: u.json.name, email: u.json.email, timeZone: u.json.zoneinfo || "Australia/Melbourne" };
+  if (u.status === 401) return { status: 401, error: (u.json && u.json.error) || "Salesforce session expired — reconnect in Settings → Connections" };
+  if (!call.username) return { status: 502, error: "Could not read your Salesforce user — reconnect in Settings → Connections" };
+  const q = `SELECT Id, Name, Email, TimeZoneSidKey FROM User WHERE Username = '${String(call.username).replace(/['\\]/g, "")}' LIMIT 1`;
+  const r = await call(`/services/data/v60.0/query?q=${encodeURIComponent(q)}`);
+  const rec = r.status === 200 && r.json && r.json.records && r.json.records[0];
+  if (!rec) return { status: r.status === 401 ? 401 : 502, error: "Could not read your Salesforce user" };
+  return { userId: rec.Id, name: rec.Name, email: rec.Email, timeZone: rec.TimeZoneSidKey || "Australia/Melbourne" };
+}
+app.get("/api/salesforce/sal/me", requireUser, rateLimit({ perMin: RATE_PER_MIN, perDay: RATE_PER_DAY, action: "sal_me" }), async (req, res) => {
+  try {
+    const call = await sfAsUser(req, res); if (!call) return;
+    const me = await sfMe(call);
+    if (me.error) return res.status(me.status).json({ error: me.error });
+    res.json(me);
+  } catch (e) {
+    console.error("sal/me error:", e && e.name, e && e.message);
+    res.status(502).json({ error: "Salesforce request failed" });
+  }
+});
+app.post("/api/salesforce/sal/apply", requireUser, rateLimit({ perMin: 20, perDay: RATE_PER_DAY, action: "sal_apply" }), async (req, res) => {
+  const checked = checkChanges(req.body && req.body.changes);
+  if (checked.error) { audit(req, "sal_refused", checked.error, 400); return res.status(400).json({ error: checked.error }); }
+  if (req.body && req.body.dryRun) return res.json({ ok: true, changes: checked.changes });
+  try {
+    const call = await sfAsUser(req, res); if (!call) return;
+    const me = await sfMe(call);
+    if (me.error) return res.status(me.status).json({ error: me.error });
+    const r = await call("/services/data/v60.0/composite", { method: "POST", body: JSON.stringify(compositeRequest(checked.changes, me.userId)) });
+    if (r.status !== 200) {
+      audit(req, "sal_failed", `composite ${r.status}`, 502);
+      return res.status(502).json({ error: `Salesforce answered ${r.status}: ${JSON.stringify(r.json).slice(0, 300)}` });
+    }
+    const results = readComposite(checked.changes, r.json);
+    const made = results.every((x) => x.ok);
+    audit(req, made ? "sal_applied" : "sal_rolled_back", checked.changes.map((c) => c.op).join(","), made ? 200 : 409);
+    res.status(made ? 200 : 409).json({ ok: made, results });
+  } catch (e) {
+    console.error("sal/apply error:", e && e.name, e && e.message);
+    audit(req, "sal_error", e && e.name, 502);
+    res.status(502).json({ error: "Salesforce request failed" });
+  }
+});
 
 app.get("/api/salesforce/*splat", requireUser, rateLimit({ perMin: RATE_PER_MIN, perDay: RATE_PER_DAY, action: "proxy" }), async (req, res) => {
   const sfPath = req.originalUrl.replace(/^\/api\/salesforce\//i, "");   // strip prefix, keep path + query
