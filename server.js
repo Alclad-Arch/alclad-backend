@@ -32,6 +32,7 @@ import { buildSummaryQuery, shapeSummary } from "./oppSummary.js";
 import { buildSearchQuery } from "./oppSearch.js";
 import { buildReviewQueries, buildPriorQueries, shapeRecord, budgetOpportunities } from "./oppReview.js";
 import { checkChanges, compositeRequest, readComposite } from "./salWrites.js";
+import { startPanelWorker } from "./panelWorker.js";
 import { serialQueue } from "./serialQueue.js";
 import { sfGrantHealth, sfGrantUsable, sfGrantSummary, SF_IDLE_DAYS } from "./sfHealth.js";
 import { syncActuals } from "./syncMyobActuals.js";
@@ -1311,4 +1312,5 @@ app.listen(PORT, () => {
   console.log(`Backend running on :${PORT}`);
   encryptTokensAtRest().catch((e) => console.error("[security] token sweep threw:", e && e.message));
   startActualsSchedule();
+  startPanelWorker();   // panel drafting runs (PANEL_WORKER=on) - panelWorker.js
 });
