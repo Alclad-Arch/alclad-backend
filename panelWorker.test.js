@@ -66,11 +66,15 @@ function fakeClaude(turns, { failAt = -1 } = {}) {
       async retrieveMetadata(id) { return { id, filename: out[id].filename, mime_type: "application/octet-stream" }; },
       async download(id) { return new Response(out[id].body); },
     },
-    beta: { messages: { async create(body) {
-      calls.push(JSON.parse(JSON.stringify(body)));
-      if (n === failAt) { n++; throw new Error("socket hang up"); }
-      return turns[n++];
-    } } },
+    // the worker streams (a plain create of a 32k-token run is refused by the SDK): stream(body).finalMessage()
+    beta: { messages: {
+      async create() { throw new Error("Streaming is required for operations that may take longer than 10 minutes"); },
+      stream(body) {
+        calls.push(JSON.parse(JSON.stringify(body)));
+        const i = n++;
+        return { async finalMessage() { if (i === failAt) throw new Error("socket hang up"); return turns[i]; } };
+      },
+    } },
   };
 }
 const res = (ids) => ({ type: "bash_code_execution_tool_result", content: { type: "bash_code_execution_result", content: ids.map((id) => ({ type: "bash_code_execution_output", file_id: id })) } });

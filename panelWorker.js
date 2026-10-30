@@ -92,7 +92,10 @@ async function realRun(t, run, anthropic) {
 
   for (let i = 0; !input.ended; i++) {
     if (i >= MAX_CALLS) throw new Error(`Still going after ${MAX_CALLS} rounds — stopped so it can be looked at`);
-    const res = await anthropic.beta.messages.create(requestBody({ messages, containerId, skillId }));
+    /* ⚠ STREAMED (prod 2026-10-30, the first real draft: "Streaming is required for operations that may take
+       longer than 10 minutes"). With 32k output tokens the SDK refuses a plain create before sending it;
+       a stream with finalMessage() is the same request and the same answer. */
+    const res = await anthropic.beta.messages.stream(requestBody({ messages, containerId, skillId })).finalMessage();
     messages = [...messages, { role: "assistant", content: res.content }];
     containerId = (res.container && res.container.id) || containerId;
     usage = addUsage(usage, res.usage);
