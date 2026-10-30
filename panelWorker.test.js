@@ -112,6 +112,33 @@ test("a long run: pause_turn is sent back as is, every call saved; the LAST publ
   assert.equal(kept.find((f) => f.name === "preview-r1-c1.png").role, "preview_image");
 });
 
+test("a redraw (part 2): the earlier reading.json and the answers go with the sheets, and the task says redraw rev 2", async () => {
+  const s = seed();
+  s.tables.panel_drafts = [
+    { id: "d1", job_id: "pj_1", rev: 1, sheet_file_ids: ["s1"], state: "superseded", reading: { spec: { panels: [{ id: "E-83" }] }, questions: ["1. E-83 or E-33?"] } },
+    { id: "d2", job_id: "pj_1", rev: 2, redraw_of: "d1", sheet_file_ids: ["s1"], state: "drafting", answers: [{ question: "E-83 or E-33?", answer: "E-83" }] },
+  ];
+  s.tables.panel_runs = [{ id: "r2", job_id: "pj_1", draft_id: "d2", mode: "redraw", status: "running", attempts: 1, input: {}, messages: null }];
+  const db = fakeDb(s); const claude = fakeClaude(TURNS);
+  await processRun({ name: "live", db }, db.T.panel_runs[0], claude, quiet);
+  assert.deepEqual(claude.uploads, ["IMG_0412.jpg", "job.json", "reading.json", "answers.json"]);
+  const first = claude.calls[0].messages[0].content;
+  assert.deepEqual(first.map((b) => b.type), ["image", "container_upload", "container_upload", "container_upload", "text"]);
+  assert.match(first[first.length - 1].text, /^Redraw\. Previous reading: reading\.json\. Answers: answers\.json .* rev 2\./);
+  assert.equal(db.T.panel_drafts[1].state, "review");
+});
+
+test("⚠ a redraw of a draft with no reading.json fails with a reason, never draws from nothing", async () => {
+  const s = seed();
+  s.tables.panel_drafts = [{ id: "d1", job_id: "pj_1", rev: 1, sheet_file_ids: ["s1"], state: "superseded", reading: null },
+    { id: "d2", job_id: "pj_1", rev: 2, redraw_of: "d1", sheet_file_ids: ["s1"], state: "drafting", answers: [] }];
+  s.tables.panel_runs = [{ id: "r2", job_id: "pj_1", draft_id: "d2", mode: "redraw", status: "running", attempts: 3, input: {}, messages: null }];
+  const db = fakeDb(s); const claude = fakeClaude(TURNS);
+  await processRun({ name: "live", db }, db.T.panel_runs[0], claude, quiet);
+  assert.match(String(db.T.panel_runs[0].error || ""), /no reading\.json/);
+  assert.equal(claude.calls.length, 0);
+});
+
 test("a run that dies part-way carries on from what was saved — no re-upload, no repeated call", async () => {
   const db = fakeDb(seed()); const claude = fakeClaude(TURNS, { failAt: 1 });
   await processRun({ name: "live", db }, db.T.panel_runs[0], claude, quiet);

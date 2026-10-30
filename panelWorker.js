@@ -84,9 +84,20 @@ async function realRun(t, run, anthropic) {
     }
     const { data: sets } = await db.from("panel_sets").select("no, label, set_m2, status").eq("job_id", job.id).order("no").then((r) => r, () => ({ data: [] }));
     const jf = await anthropic.files.upload({ file: await toFile(Buffer.from(JSON.stringify(jobJson(job, sets || [], run.input || {}), null, 2)), "job.json", { type: "application/json" }) });
-    const text = taskText(run.mode, { sheetNames: sent.map((s) => s.name), rev: draft.rev });
-    messages = [{ role: "user", content: firstContent({ sheets: sent, uploads: [jf.id], text }) }];
-    input = { ...input, task: text, uploaded: { sheets: sent.map((s) => s.fileId), job: jf.id } };
+    const uploads = [jf.id];
+    /* A REDRAW (part 2, review-loop.md "Answering"): the earlier draft's reading.json and the person's answers
+       go with the sheets, so the drafter starts from what it read and changes only what the answers say. */
+    if (run.mode === "redraw") {
+      const { data: prev } = await db.from("panel_drafts").select("reading").eq("id", draft.redraw_of).single();
+      if (!prev || !prev.reading) throw new Error("The draft being redrawn has no reading.json to start from");
+      const json = (v, name) => toFile(Buffer.from(JSON.stringify(v, null, 2)), name, { type: "application/json" });
+      const rf = await anthropic.files.upload({ file: await json(prev.reading, "reading.json") });
+      const af = await anthropic.files.upload({ file: await json(draft.answers || [], "answers.json") });
+      uploads.push(rf.id, af.id);
+    }
+    const text = taskText(run.mode, { sheetNames: sent.map((s) => s.name), rev: draft.rev, draftName: job.name });
+    messages = [{ role: "user", content: firstContent({ sheets: sent, uploads, text }) }];
+    input = { ...input, task: text, uploaded: { sheets: sent.map((s) => s.fileId), job: jf.id, ...(uploads.length > 1 ? { reading: uploads[1], answers: uploads[2] } : {}) } };
     await save({ messages, input });
   }
 
