@@ -19,6 +19,7 @@ function fakeDb(seed) {
     const api = {
       select() { return api; }, order() { return api; },
       eq(k, v) { f.push((r) => r[k] === v); return api; },
+      neq(k, v) { f.push((r) => r[k] !== v); return api; },
       in(k, vs) { f.push((r) => vs.includes(r[k])); return api; },
       update(p) { patch = p; return api; },
       insert(r) { ins = Array.isArray(r) ? r : [r]; return api; },
@@ -26,8 +27,9 @@ function fakeDb(seed) {
       then(res, rej) {
         try {
           if (ins) {
-            for (const r of ins) { if (table === "panel_files" && rows().some((x) => x.storage_path === r.storage_path)) return res({ error: { message: "duplicate key" } }); rows().push({ id: "f" + rows().length, ...r }); }
-            return res({ data: ins, error: null });
+            const made = [];
+            for (const r of ins) { if (table === "panel_files" && rows().some((x) => x.storage_path === r.storage_path)) return res({ error: { message: "duplicate key" } }); const row = { id: "f" + rows().length, ...r }; rows().push(row); made.push(row); }
+            return res({ data: one ? made[0] : made, error: null });
           }
           const hit = rows().filter((r) => f.every((fn) => fn(r)));
           if (patch) { hit.forEach((r) => Object.assign(r, JSON.parse(JSON.stringify(patch)))); return res({ data: hit, error: null }); }
@@ -139,6 +141,72 @@ test("⚠ a redraw of a draft with no reading.json fails with a reason, never dr
   assert.equal(claude.calls.length, 0);
 });
 
+// ── PART 3: a release ──
+const releaseClaude = (main = "6197 Storage King Croydon - Main Drawing File.dxf") => {
+  const c = fakeClaude([{ stop_reason: "end_turn", container: { id: "cntr_r" }, usage: { input_tokens: 10, output_tokens: 5 }, content: [res(["rm", "rmain", "rres", "rmach"]), { type: "text", text: "Released set 1." }] }]);
+  const files = {
+    rm: { filename: "manifest.json", body: JSON.stringify({ kind: "release", files: [{ name: main, role: "main_drawing_file" }, { name: "result.json", role: "release_result" }, { name: "6197 Storage King Croydon - Set 1 - Machining.dxf", role: "machining" }] }) },
+    rmain: { filename: main, body: "MAIN WITH SET 1" },
+    rres: { filename: "result.json", body: JSON.stringify({ set_no: 1, set_m2: 38.2, total_m2: 200.6, library: [{ id: "OC-01", status: "USED" }], layout: [{ sheet: 1, ids: ["E-83"] }], sheets: ["White 3200x1250 x3"], qa: {} }) },
+    rmach: { filename: "6197 Storage King Croydon - Set 1 - Machining.dxf", body: "CAM" },
+  };
+  c.files.retrieveMetadata = async (id) => ({ id, filename: files[id].filename, mime_type: "application/octet-stream" });
+  c.files.download = async (id) => new Response(files[id].body);
+  return c;
+};
+const releaseSeed = (over = {}) => {
+  const s = seed();
+  s.tables.panel_jobs[0] = { ...s.tables.panel_jobs[0], running_total_m2: 162.4, offcuts: [{ id: "OC-01", status: "IN STOCK" }], existing_spec: { panels: [{ ids: ["N-19"] }] }, current_main_file_id: "mf1", ...(over.job || {}) };
+  s.tables.panel_drafts = [{ id: "d1", job_id: "pj_1", rev: 2, state: "approved", spec: { panels: [{ ids: ["E-83"] }, { ids: ["N-19"] }] } }];
+  s.tables.panel_sets = [{ id: "set1", job_id: "pj_1", draft_id: "d1", no: 1, label: "South", date: "2026-10-30", status: "releasing", ...(over.set || {}) }];
+  s.tables.panel_files.push({ id: "mf1", job_id: "pj_1", kind: "main", version: 1, name: "6197 Storage King Croydon - Main Drawing File.dxf", storage_path: "pj_1/main/v1.dxf" });
+  s.storage["pj_1/main/v1.dxf"] = Buffer.from("MAIN BEFORE");
+  s.tables.panel_runs = [{ id: "rel1", job_id: "pj_1", draft_id: "d1", set_id: "set1", mode: "release", status: "running", attempts: 1, input: over.input || {}, messages: null }];
+  return s;
+};
+
+test("a release: from the APPROVED spec (no sheets), the Main Drawing File appended as a new version, the job carries on", async () => {
+  const db = fakeDb(releaseSeed()); const claude = releaseClaude();
+  await processRun({ name: "live", db }, db.T.panel_runs[0], claude, quiet);
+  assert.equal(db.T.panel_runs[0].status, "done", db.T.panel_runs[0].error);
+  assert.deepEqual(claude.uploads, ["job.json", "spec.json", "offcuts.json", "6197 Storage King Croydon - Main Drawing File.dxf"]);
+  const first = claude.calls[0].messages[0].content;
+  assert.ok(!first.some((b) => b.type === "image" || b.type === "document"), "no sheets on a release");
+  assert.match(first[first.length - 1].text, /^Release the approved draft\. Spec: spec\.json\. Set 1 "South", date 2026-10-30\. Main Drawing File: 6197 Storage King Croydon - Main Drawing File\.dxf\. Offcuts: offcuts\.json\. Ordered layout: none\./);
+  const set = db.T.panel_sets[0], job = db.T.panel_jobs[0];
+  assert.equal(set.status, "released"); assert.equal(set.set_m2, 38.2); assert.equal(set.total_m2, 200.6); assert.deepEqual(set.layout, [{ sheet: 1, ids: ["E-83"] }]);
+  const main = db.T.panel_files.find((f) => f.kind === "main" && f.version === 2);
+  assert.ok(main && /^pj_1\/main\/set-1-/.test(main.storage_path), "the Main Drawing File is the job's NEXT version, never overwriting v1");
+  assert.equal(db.files.get("pj_1/main/v1.dxf").toString(), "MAIN BEFORE");
+  assert.equal(set.main_file_id, main.id); assert.equal(job.current_main_file_id, main.id);
+  assert.equal(job.running_total_m2, 200.6); assert.deepEqual(job.offcuts, [{ id: "OC-01", status: "USED" }]);
+  assert.deepEqual(job.existing_spec.panels.map((p) => p.ids[0]), ["N-19", "E-83"], "this set's NEW panels added; one already there not doubled");
+  assert.equal(db.T.panel_drafts[0].state, "released");
+  assert.ok(db.T.panel_files.some((f) => f.kind === "release_output" && f.set_id === "set1" && /^pj_1\/sets\/1\//.test(f.storage_path)));
+});
+
+test("a REISSUE starts from the total and the Main Drawing File BEFORE this set, and an ordered nest is sent and kept", async () => {
+  const s = releaseSeed({ input: { reissue: true }, set: { status: "releasing", set_m2: 38.2, main_file_id: "mf2", ordered_at: "2026-10-31T00:00:00Z", layout: [{ sheet: 1, ids: ["E-83"], ordered: true }] }, job: { running_total_m2: 200.6, current_main_file_id: "mf2" } });
+  s.tables.panel_files.push({ id: "mf2", job_id: "pj_1", kind: "main", version: 2, name: "6197 Storage King Croydon - Main Drawing File.dxf", storage_path: "pj_1/main/v2.dxf" });
+  s.storage["pj_1/main/v2.dxf"] = Buffer.from("MAIN WITH SET 1 ALREADY");
+  const db = fakeDb(s); const claude = releaseClaude();
+  await processRun({ name: "live", db }, db.T.panel_runs[0], claude, quiet);
+  assert.equal(db.T.panel_runs[0].status, "done", db.T.panel_runs[0].error);
+  assert.deepEqual(claude.uploads, ["job.json", "spec.json", "offcuts.json", "layout.json", "6197 Storage King Croydon - Main Drawing File.dxf"]);
+  assert.match(claude.calls[0].messages[0].content.at(-1).text, /Ordered layout: layout\.json\./);
+  assert.deepEqual(db.T.panel_sets[0].layout, [{ sheet: 1, ids: ["E-83"], ordered: true }], "⚠ an ordered nest is never replaced by a new one");
+});
+
+test("⚠ a failed release fails the SET, not the approved draft; a release is never a practice replay", async () => {
+  const s = releaseSeed(); s.tables.panel_runs[0].attempts = 3; s.tables.panel_runs[0].fake = true;
+  const db = fakeDb(s); const claude = fakeClaude([{ stop_reason: "end_turn", content: [{ type: "text", text: "no files" }] }]);
+  await processRun({ name: "live", db }, db.T.panel_runs[0], claude, quiet);
+  assert.equal(claude.calls.length, 1, "a real call, not a fixture replay");
+  assert.equal(db.T.panel_runs[0].status, "failed");
+  assert.equal(db.T.panel_sets[0].status, "failed");
+  assert.equal(db.T.panel_drafts[0].state, "approved");
+});
+
 test("a run that dies part-way carries on from what was saved — no re-upload, no repeated call", async () => {
   const db = fakeDb(seed()); const claude = fakeClaude(TURNS, { failAt: 1 });
   await processRun({ name: "live", db }, db.T.panel_runs[0], claude, quiet);
@@ -175,7 +243,7 @@ test("failures: retried, then stopped with the reason on the run and the draft",
   await processRun({ name: "live", db }, run, fakeClaude([], { failAt: 0 }), quiet);
   assert.equal(run.status, "failed"); assert.match(run.error, /socket hang up/); assert.ok(run.finished_at);
   assert.equal(db.T.panel_drafts[0].state, "failed");
-  const db2 = fakeDb(seed()); db2.T.panel_runs[0].mode = "release";
+  const db2 = fakeDb(seed()); db2.T.panel_runs[0].mode = "recut";   // release is part 3 (done); recut is part 4
   await processRun({ name: "live", db: db2 }, db2.T.panel_runs[0], fakeClaude([]), quiet);
   assert.match(db2.T.panel_runs[0].error, /later part of the build/);
   assert.equal(db2.T.panel_runs[0].status, "failed");                                // not retried: it can't work yet
