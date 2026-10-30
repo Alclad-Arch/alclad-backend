@@ -24,9 +24,12 @@ export function taskText(mode, x = {}) {
 }
 
 // job.json — app-contract.md §3, from the panel_jobs row (+ its sets)
-export function jobJson(job, sets = []) {
+/* `batch`: what this batch of sheets says over the job's settings — its sheet view (Jed 2026-10-30: "Sheets
+   could potentially come in different orientations for the same job"), chosen at Draft these. */
+export function jobJson(job, sets = [], batch = {}) {
+  const over = batch && (batch.sheet_view === 'front' || batch.sheet_view === 'rear') ? { sheet_view: batch.sheet_view } : {};
   return {
-    settings: { job: job.name, ...(job.settings || {}) },
+    settings: { job: job.name, ...(job.settings || {}), ...over },
     settings_confirmed: !!job.settings_confirmed,
     notes: job.notes || [],
     rules: job.rules || [],

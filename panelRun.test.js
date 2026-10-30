@@ -21,6 +21,14 @@ test("job.json from the job row: settings carry the job name; sets and totals as
   assert.equal(j.running_total_m2, 162.4);
 });
 
+test("a batch's sheet view (chosen at Draft these) is what the drafter is told; nonsense is ignored", () => {
+  const job = { name: "6197", settings: { sheet_view: "rear", colour: "White" } };
+  assert.equal(jobJson(job, [], { sheet_view: "front" }).settings.sheet_view, "front");
+  assert.equal(jobJson(job, [], {}).settings.sheet_view, "rear");
+  assert.equal(jobJson(job, [], { sheet_view: "sideways" }).settings.sheet_view, "rear");
+  assert.equal(jobJson(job, [], { sheet_view: "front" }).settings.colour, "White");
+});
+
 test("the first message: sheets SEEN (image / document), files for the scripts, then the task", () => {
   const c = firstContent({ sheets: [{ fileId: "f1", mime: "image/jpeg", name: "a.jpg" }, { fileId: "f2", mime: "application/pdf", name: "b.pdf" }], uploads: ["j1"], text: "go" });
   assert.deepEqual(c.map((b) => b.type), ["image", "document", "container_upload", "text"]);

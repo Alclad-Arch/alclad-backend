@@ -83,7 +83,7 @@ async function realRun(t, run, anthropic) {
       sent.push({ fileId: f.id, mime: s.mime, name: s.name });
     }
     const { data: sets } = await db.from("panel_sets").select("no, label, set_m2, status").eq("job_id", job.id).order("no").then((r) => r, () => ({ data: [] }));
-    const jf = await anthropic.files.upload({ file: await toFile(Buffer.from(JSON.stringify(jobJson(job, sets || []), null, 2)), "job.json", { type: "application/json" }) });
+    const jf = await anthropic.files.upload({ file: await toFile(Buffer.from(JSON.stringify(jobJson(job, sets || [], run.input || {}), null, 2)), "job.json", { type: "application/json" }) });
     const text = taskText(run.mode, { sheetNames: sent.map((s) => s.name), rev: draft.rev });
     messages = [{ role: "user", content: firstContent({ sheets: sent, uploads: [jf.id], text }) }];
     input = { ...input, task: text, uploaded: { sheets: sent.map((s) => s.fileId), job: jf.id } };
