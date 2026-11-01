@@ -36,13 +36,13 @@ const parse = (buf) => { try { return JSON.parse(buf.toString("utf8")); } catch 
 
 // store one returned file — once (its path is unique; a second store of the same path is skipped).
 // Returns { path, id, had } — `had` when it was already stored (a resumed run).
-async function keepFile(db, { jobId, draftId, name, buf, mime, role, kind = "draft_output", path = null, setId = null, version = null }) {
+async function keepFile(db, { jobId, draftId, name, buf, mime, role, kind = "draft_output", path = null, setId = null, version = null, recutId = null }) {
   path = path || outputPath(jobId, draftId, name);
   const { data: had } = await db.from("panel_files").select("id").eq("storage_path", path).maybeSingle();
   if (had) return { path, id: had.id, had: true };
   const up = await db.storage.from(BUCKET).upload(path, buf, { contentType: mime || "application/octet-stream", upsert: false });
   if (up.error && !/exists|duplicate/i.test(up.error.message)) throw new Error(`storing ${name}: ${up.error.message}`);
-  const { data: row, error } = await db.from("panel_files").insert({ job_id: jobId, kind, role, name, mime, size_bytes: buf.length, sha256: sha(buf), storage_path: path, draft_id: draftId, set_id: setId, version, created_by: "panel worker" }).select("id").maybeSingle();
+  const { data: row, error } = await db.from("panel_files").insert({ job_id: jobId, kind, role, name, mime, size_bytes: buf.length, sha256: sha(buf), storage_path: path, draft_id: draftId, set_id: setId, version, created_by: "panel worker", ...(recutId ? { recut_id: recutId } : {}) }).select("id").maybeSingle();
   if (error && !/duplicate key/i.test(error.message)) throw new Error(`recording ${name}: ${error.message}`);
   return { path, id: row ? row.id : null, had: false };
 }
@@ -90,6 +90,68 @@ async function finishRelease(db, run, files) {
     updated_at: now,
   }).eq("id", job.id);
   await db.from("panel_drafts").update({ state: "released", updated_at: now }).eq("id", run.draft_id);
+}
+
+/* WHAT A RECUT MAKES (review-loop.md "Cut, recut"; Jed 2026-11-01): the named panels' own files under
+   <job>/sets/<n>/recut-<k>/, the Main Drawing File with "SET N - RECUT 0k - <IDs> - <reason>" appended as the
+   job's next version, and from result.json the recut's m2, nest and sheets. The job's offcut library and
+   current Main Drawing File carry on from it — but NOT its running total or existing_spec: a recut remakes
+   panels already counted (its m2 is REWORK, logged apart when it is cut). The cut set is never touched. */
+async function finishRecut(db, run, files) {
+  const { data: recut } = await db.from("panel_recuts").select("*").eq("id", run.recut_id).single();
+  const { data: set } = await db.from("panel_sets").select("*").eq("id", run.set_id).single();
+  const { data: job } = await db.from("panel_jobs").select("*").eq("id", run.job_id).single();
+  const resultFile = files.find((f) => f.role === "release_result" || f.name === "result.json");
+  const result = resultFile ? parse(resultFile.buf) : null;
+  if (!result) throw new Error("The recut returned no result.json — it can't be recorded");
+  const safe = (n) => String(n || "file").replace(/[\\/]+/g, "_").replace(/[^\w .()+&,-]/g, "_").slice(0, 180);
+  const tag = `recut-${String(recut.no).padStart(2, "0")}`;
+  let mainId = null;
+  for (const f of files) {
+    if (f.role === "main_drawing_file") {
+      const path = `${run.job_id}/main/set-${set.no}-${tag}-${String(run.id).slice(0, 8)} - ${safe(f.name)}`;
+      const { data: vs } = await db.from("panel_files").select("version").eq("job_id", run.job_id).eq("kind", "main");
+      const next = Math.max(0, ...(vs || []).map((v) => Number(v.version) || 0)) + 1;
+      mainId = (await keepFile(db, { jobId: run.job_id, draftId: run.draft_id, name: f.name, buf: f.buf, mime: f.mime, role: f.role, kind: "main", path, setId: set.id, version: next, recutId: recut.id })).id;
+    } else {
+      await keepFile(db, { jobId: run.job_id, draftId: run.draft_id, name: f.name, buf: f.buf, mime: f.mime, role: f.role, kind: "recut_output", path: `${run.job_id}/sets/${set.no}/${tag}/${String(run.id).slice(0, 8)}/${safe(f.name)}`, setId: set.id, recutId: recut.id });
+    }
+  }
+  const now = new Date().toISOString();
+  await db.from("panel_recuts").update({
+    status: "released", m2: result.set_m2 ?? null, layout: result.layout ?? null, sheets: result.sheets ?? null, qa: result.qa ?? null,
+    main_file_id: mainId || null, released_at: now, updated_at: now,
+  }).eq("id", recut.id);
+  await db.from("panel_jobs").update({
+    offcuts: Array.isArray(result.library) ? result.library : job.offcuts,
+    current_main_file_id: mainId || job.current_main_file_id,
+    updated_at: now,
+  }).eq("id", job.id);
+}
+
+/* A RECUT's first message: like a release — no sheets, the set's APPROVED spec (the drafter takes only the named
+   panels from it), job.json, offcuts.json (an in-stock offcut is used first) and the CURRENT Main Drawing File to
+   append to. */
+async function recutStart(db, anthropic, run, job, draft) {
+  const { data: recut } = await db.from("panel_recuts").select("*").eq("id", run.recut_id).single();
+  const { data: set } = await db.from("panel_sets").select("*").eq("id", run.set_id).single();
+  if (!recut || !set) throw new Error("The recut, or its set, is gone");
+  if (!draft || !draft.spec) throw new Error("The set's approved draft has no spec.json to recut from");
+  const main = job.current_main_file_id ? (await db.from("panel_files").select("*").eq("id", job.current_main_file_id).maybeSingle()).data : null;
+  const { data: sets } = await db.from("panel_sets").select("no, label, set_m2, status").eq("job_id", job.id).order("no").then((r) => r, () => ({ data: [] }));
+  const json = async (v, name) => (await anthropic.files.upload({ file: await toFile(Buffer.from(JSON.stringify(v, null, 2)), name, { type: "application/json" }) })).id;
+  const uploads = [
+    await json(jobJson(job, sets || []), "job.json"),
+    await json(draft.spec, "spec.json"),
+    await json(Array.isArray(job.offcuts) ? job.offcuts : [], "offcuts.json"),
+  ];
+  if (main) {
+    const { data: blob, error } = await db.storage.from(BUCKET).download(main.storage_path);
+    if (error) throw new Error(`reading the Main Drawing File: ${error.message}`);
+    uploads.push((await anthropic.files.upload({ file: await toFile(await bufOf(blob), main.name, { type: main.mime || "application/dxf" }) })).id);
+  }
+  const text = taskText("recut", { ids: recut.panel_ids, setNo: set.no, reason: recut.reason, recutNo: String(recut.no).padStart(2, "0"), mainFile: main ? main.name : null });
+  return { text, uploads };
 }
 
 // what the draft becomes once its files are in: review.json says how it went
@@ -152,8 +214,8 @@ async function realRun(t, run, anthropic) {
   const save = (patch) => db.from("panel_runs").update({ ...patch, lease_until: new Date(Date.now() + LEASE_MS).toISOString(), updated_at: new Date().toISOString() }).eq("id", run.id);
   let messages = run.messages, containerId = run.container_id, usage = run.usage, input = run.input || {};
 
-  if (!messages && run.mode === "release") {
-    const { text, uploads } = await releaseStart(db, anthropic, run, job, draft);
+  if (!messages && (run.mode === "release" || run.mode === "recut")) {
+    const { text, uploads } = run.mode === "recut" ? await recutStart(db, anthropic, run, job, draft) : await releaseStart(db, anthropic, run, job, draft);
     messages = [{ role: "user", content: firstContent({ sheets: [], uploads, text }) }];
     input = { ...input, task: text, uploaded: { files: uploads } };
     await save({ messages, input });
@@ -236,14 +298,15 @@ async function fakeRun(t) {
 export async function processRun(t, run, anthropic, log = console) {
   const db = t.db;
   try {
-    if (!["draft", "redraw", "release"].includes(run.mode)) throw new Error(`Runs of mode "${run.mode}" come in a later part of the build`);
-    const release = run.mode === "release";
-    // a release is never a practice replay: its files are what production cuts from
-    const fake = !release && (run.fake || process.env.PANEL_FAKE === "on");
+    if (!["draft", "redraw", "release", "recut"].includes(run.mode)) throw new Error(`Runs of mode "${run.mode}" come in a later part of the build`);
+    const release = run.mode === "release", recut = run.mode === "recut";
+    // a release or a recut is never a practice replay: its files are what production cuts from
+    const fake = !release && !recut && (run.fake || process.env.PANEL_FAKE === "on");
     const { got, text, containerId } = fake ? await fakeRun(t) : await realRun(t, run, anthropic);
     const manifest = parse((got.find((f) => f.name === "manifest.json") || {}).buf || Buffer.from(""));
     const files = got.map((f) => ({ ...f, role: roleOf(manifest, f.name) || (f.name === "manifest.json" ? "manifest" : f.name === "result.json" ? "release_result" : null) }));
     if (release) await finishRelease(db, run, files);
+    else if (recut) await finishRecut(db, run, files);
     else {
       for (const f of files) await keepFile(db, { jobId: run.job_id, draftId: run.draft_id, name: f.name, buf: f.buf, mime: f.mime, role: f.role });
       await finishDraft(db, run, files, text, containerId);
@@ -256,6 +319,8 @@ export async function processRun(t, run, anthropic, log = console) {
     await db.from("panel_runs").update({ status: final ? "failed" : "queued", error: msg.slice(0, 2000), lease_until: null, updated_at: new Date().toISOString(), ...(final ? { finished_at: new Date().toISOString() } : {}) }).eq("id", run.id);
     // a failed release fails its SET — the approved draft stays approved, and Try again releases it
     if (final && run.mode === "release" && run.set_id) await db.from("panel_sets").update({ status: "failed", updated_at: new Date().toISOString() }).eq("id", run.set_id);
+    // a failed recut fails the RECUT — its cut set, and the approved draft, are left alone
+    else if (final && run.mode === "recut") { if (run.recut_id) await db.from("panel_recuts").update({ status: "failed", updated_at: new Date().toISOString() }).eq("id", run.recut_id); }
     else if (final && run.draft_id) await db.from("panel_drafts").update({ state: "failed", updated_at: new Date().toISOString() }).eq("id", run.draft_id);
     log.error(`[panels] ${t.name} run ${run.id} ${final ? "FAILED" : "will retry"}: ${msg}`);
   }

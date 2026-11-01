@@ -207,6 +207,58 @@ test("⚠ a failed release fails the SET, not the approved draft; a release is n
   assert.equal(db.T.panel_drafts[0].state, "approved");
 });
 
+// ── a RECUT (Jed 2026-11-01): panels of a CUT set remade ──
+const recutSeed = () => {
+  const s = releaseSeed({ set: { status: "cut", set_m2: 38.2, main_file_id: "mf1" } });
+  s.tables.panel_recuts = [{ id: "rc1", set_id: "set1", job_id: "pj_1", no: 1, panel_ids: ["E-83"], reason: "damaged on site", status: "releasing" }];
+  s.tables.panel_runs = [{ id: "rcrun1", job_id: "pj_1", draft_id: "d1", set_id: "set1", recut_id: "rc1", mode: "recut", status: "running", attempts: 1, input: {}, messages: null }];
+  return s;
+};
+const recutClaude = () => {
+  const c = releaseClaude();
+  const files = {
+    rm: { filename: "manifest.json", body: JSON.stringify({ kind: "release", files: [{ name: "6197 Storage King Croydon - Main Drawing File.dxf", role: "main_drawing_file" }, { name: "result.json", role: "release_result" }, { name: "6197 Storage King Croydon - Set 1 - RECUT 01 - E-83 - Machining.dxf", role: "machining" }] }) },
+    rmain: { filename: "6197 Storage King Croydon - Main Drawing File.dxf", body: "MAIN WITH RECUT 01" },
+    rres: { filename: "result.json", body: JSON.stringify({ set_no: 1, set_m2: 2.4, total_m2: 202.9, library: [{ id: "OC-01", status: "USED" }], layout: [{ sheet: "OC-01", ids: ["E-83"] }], sheets: ["offcut OC-01"], qa: {} }) },
+    rmach: { filename: "6197 Storage King Croydon - Set 1 - RECUT 01 - E-83 - Machining.dxf", body: "CAM RECUT" },
+  };
+  c.files.retrieveMetadata = async (id) => ({ id, filename: files[id].filename, mime_type: "application/octet-stream" });
+  c.files.download = async (id) => new Response(files[id].body);
+  return c;
+};
+
+test("a recut: from the set's APPROVED spec, the named panels, the Main Drawing File appended — the job's total and the cut set untouched", async () => {
+  const db = fakeDb(recutSeed()); const claude = recutClaude();
+  await processRun({ name: "live", db }, db.T.panel_runs[0], claude, quiet);
+  assert.equal(db.T.panel_runs[0].status, "done", db.T.panel_runs[0].error);
+  assert.deepEqual(claude.uploads, ["job.json", "spec.json", "offcuts.json", "6197 Storage King Croydon - Main Drawing File.dxf"]);
+  const first = claude.calls[0].messages[0].content;
+  assert.ok(!first.some((b) => b.type === "image" || b.type === "document"), "no sheets on a recut");
+  assert.match(first.at(-1).text, /^Recut panels E-83 of set 1: damaged on site\. Spec: spec\.json\. Recut 01\. Main Drawing File: 6197 Storage King Croydon - Main Drawing File\.dxf\. Offcuts: offcuts\.json\./);
+  const rc = db.T.panel_recuts[0], set = db.T.panel_sets[0], job = db.T.panel_jobs[0];
+  assert.equal(rc.status, "released"); assert.equal(rc.m2, 2.4); assert.deepEqual(rc.layout, [{ sheet: "OC-01", ids: ["E-83"] }]);
+  const main = db.T.panel_files.find((f) => f.kind === "main" && f.version === 2);
+  assert.ok(main && /^pj_1\/main\/set-1-recut-01-/.test(main.storage_path) && main.recut_id === "rc1", "the Main Drawing File's NEXT version, from this recut");
+  assert.equal(db.files.get("pj_1/main/v1.dxf").toString(), "MAIN BEFORE");
+  assert.equal(rc.main_file_id, main.id); assert.equal(job.current_main_file_id, main.id);
+  assert.deepEqual(job.offcuts, [{ id: "OC-01", status: "USED" }], "the offcut it used is marked used");
+  assert.equal(job.running_total_m2, 162.4, "⚠ a recut never adds to the job's running total — it remakes panels already counted");
+  assert.deepEqual(job.existing_spec.panels.map((p) => p.ids[0]), ["N-19"], "⚠ …nor to existing_spec");
+  assert.equal(set.status, "cut"); assert.equal(set.set_m2, 38.2); assert.equal(set.main_file_id, "mf1", "⚠ the cut set is never touched");
+  assert.ok(db.T.panel_files.some((f) => f.kind === "recut_output" && f.recut_id === "rc1" && /^pj_1\/sets\/1\/recut-01\//.test(f.storage_path)));
+});
+
+test("⚠ a failed recut fails the RECUT — the cut set and the approved draft are left alone; never a practice replay", async () => {
+  const s = recutSeed(); s.tables.panel_runs[0].attempts = 3; s.tables.panel_runs[0].fake = true;
+  const db = fakeDb(s); const claude = fakeClaude([{ stop_reason: "end_turn", content: [{ type: "text", text: "no files" }] }]);
+  await processRun({ name: "live", db }, db.T.panel_runs[0], claude, quiet);
+  assert.equal(claude.calls.length, 1, "a real call, not a fixture replay");
+  assert.equal(db.T.panel_runs[0].status, "failed");
+  assert.equal(db.T.panel_recuts[0].status, "failed");
+  assert.equal(db.T.panel_sets[0].status, "cut");
+  assert.equal(db.T.panel_drafts[0].state, "approved");
+});
+
 test("a run that dies part-way carries on from what was saved — no re-upload, no repeated call", async () => {
   const db = fakeDb(seed()); const claude = fakeClaude(TURNS, { failAt: 1 });
   await processRun({ name: "live", db }, db.T.panel_runs[0], claude, quiet);
@@ -243,7 +295,7 @@ test("failures: retried, then stopped with the reason on the run and the draft",
   await processRun({ name: "live", db }, run, fakeClaude([], { failAt: 0 }), quiet);
   assert.equal(run.status, "failed"); assert.match(run.error, /socket hang up/); assert.ok(run.finished_at);
   assert.equal(db.T.panel_drafts[0].state, "failed");
-  const db2 = fakeDb(seed()); db2.T.panel_runs[0].mode = "recut";   // release is part 3 (done); recut is part 4
+  const db2 = fakeDb(seed()); db2.T.panel_runs[0].mode = "sync";   // a mode no part of the build does yet
   await processRun({ name: "live", db: db2 }, db2.T.panel_runs[0], fakeClaude([]), quiet);
   assert.match(db2.T.panel_runs[0].error, /later part of the build/);
   assert.equal(db2.T.panel_runs[0].status, "failed");                                // not retried: it can't work yet

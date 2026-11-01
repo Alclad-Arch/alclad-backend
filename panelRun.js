@@ -19,7 +19,7 @@ export function taskText(mode, x = {}) {
   if (mode === "draft") return `New draft. Job: job.json. Sheets attached: ${names}. Draft them with the alclad-panel-drafting skill.`;
   if (mode === "redraw") return `Redraw. Previous reading: reading.json. Answers: answers.json (list of {question, answer}). Draft ${x.draftName || "the job"} rev ${x.rev}. Sheets attached: ${names}.`;
   if (mode === "release") return `Release the approved draft. Spec: spec.json. Set ${x.setNo} "${x.setLabel}", date ${x.date}. Main Drawing File: ${x.mainFile || "none - first set"}. Offcuts: offcuts.json. Ordered layout: ${x.layout ? "layout.json" : "none"}.`;
-  if (mode === "recut") return `Recut panels ${(x.ids || []).join(", ")} of set ${x.setNo}: ${x.reason}. Recut ${x.recutNo}. Main Drawing File: ${x.mainFile || "none"}. Offcuts: offcuts.json.`;
+  if (mode === "recut") return `Recut panels ${(x.ids || []).join(", ")} of set ${x.setNo}: ${x.reason}. Spec: spec.json. Recut ${x.recutNo}. Main Drawing File: ${x.mainFile || "none"}. Offcuts: offcuts.json.`;
   throw new Error("Unknown run mode: " + mode);
 }
 
