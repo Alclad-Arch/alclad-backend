@@ -15,6 +15,8 @@ const APP = () => (process.env.PANEL_APP_URL || "https://alclad.app").replace(/\
 export function cardFor(ev) {
   const job = (ev.job && ev.job.name) || "A panel job";
   const base = `${APP()}/production/cladding/panels/job/${encodeURIComponent((ev.job && ev.job.id) || "")}`;
+  // ASK PETE (step 3, Jed 2026-11-01: the card's Open button lands in Pete's chat on that job — and that draft)
+  const pete = `${APP()}/pete?job=${encodeURIComponent((ev.job && ev.job.id) || "")}`;
   if (ev.kind === "draft") {
     const d = ev.draft || {};
     const attention = !/^awaiting review$/i.test(String(d.review_status || ""));
@@ -24,18 +26,19 @@ export function cardFor(ev) {
       line: attention ? `Rev ${d.rev || 1}: ${d.review_status || "needs attention"}. Open it to see what the drafter couldn't do.`
         : `Rev ${d.rev || 1} is drawn${qs ? `, with ${qs} question${qs === 1 ? "" : "s"} to answer` : ""}. Check it and approve or answer.`,
       url: `${base}/draft/${encodeURIComponent(d.id || "")}`,
+      pete: `${pete}&draft=${encodeURIComponent(d.id || "")}`,
     };
   }
   if (ev.kind === "release") {
     const s = ev.set || {};
-    return { title: `Set ${s.no} released — ${job}`, line: `Set ${s.no}${s.label ? ` "${s.label}"` : ""}${s.set_m2 != null ? `, ${Number(s.set_m2).toFixed(1)} m²` : ""}: its files are ready. Mark it cut when it's being cut.`, url: base };
+    return { title: `Set ${s.no} released — ${job}`, line: `Set ${s.no}${s.label ? ` "${s.label}"` : ""}${s.set_m2 != null ? `, ${Number(s.set_m2).toFixed(1)} m²` : ""}: its files are ready. Mark it cut when it's being cut.`, url: base, pete };
   }
   if (ev.kind === "recut") {
     const r = ev.recut || {}, s = ev.set || {};
-    return { title: `Recut ready — ${job}`, line: `Set ${s.no} recut ${String(r.no || 1).padStart(2, "0")} (${(r.panel_ids || []).join(", ")}${r.reason ? ` — ${r.reason}` : ""})${r.m2 != null ? `, ${Number(r.m2).toFixed(1)} m²` : ""}: its files are ready.`, url: base };
+    return { title: `Recut ready — ${job}`, line: `Set ${s.no} recut ${String(r.no || 1).padStart(2, "0")} (${(r.panel_ids || []).join(", ")}${r.reason ? ` — ${r.reason}` : ""})${r.m2 != null ? `, ${Number(r.m2).toFixed(1)} m²` : ""}: its files are ready.`, url: base, pete };
   }
   const what = ev.mode === "release" ? "A release" : ev.mode === "recut" ? "A recut" : ev.mode === "redraw" ? "A redraw" : "A draft";
-  return { title: `⚠ ${what} failed — ${job}`, line: `${String(ev.error || "No reason given").slice(0, 300)} — open it and Try again, or tell Jed.`, url: base };
+  return { title: `⚠ ${what} failed — ${job}`, line: `${String(ev.error || "No reason given").slice(0, 300)} — open it and Try again, or tell Jed.`, url: base, pete };
 }
 
 /* The webhook body: one Adaptive Card — what both Teams webhook kinds accept. */
@@ -50,7 +53,10 @@ export function teamsBody(card) {
           { type: "TextBlock", text: card.title, weight: "Bolder", size: "Medium", wrap: true },
           { type: "TextBlock", text: card.line, wrap: true },
         ],
-        actions: [{ type: "Action.OpenUrl", title: "Open in alclad.app", url: card.url }],
+        // Ask Pete first (his chat on the job, the drawing beside it); the page itself second
+        actions: card.pete
+          ? [{ type: "Action.OpenUrl", title: "Ask Pete", url: card.pete }, { type: "Action.OpenUrl", title: "Open the page", url: card.url }]
+          : [{ type: "Action.OpenUrl", title: "Open in alclad.app", url: card.url }],
       },
     }],
   };

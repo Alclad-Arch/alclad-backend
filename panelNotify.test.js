@@ -46,6 +46,15 @@ test("the webhook body: one Adaptive Card, title, line, an Open button", () => {
   assert.deepEqual(card.body.map((x) => x.text), ["T", "L"]); assert.equal(card.actions[0].url, "https://x/y");
 });
 
+test("Ask Pete (step 3): every card's first button opens Pete's chat on the job — a draft's on that draft — the page second", () => {
+  const d = cardFor({ kind: "draft", job, draft: { id: "d7", rev: 2, review_status: "awaiting review", questions: 1 } });
+  assert.equal(d.pete, "https://alclad.app/pete?job=pj_1&draft=d7");
+  assert.equal(cardFor({ kind: "release", job, set: { no: 1 } }).pete, "https://alclad.app/pete?job=pj_1");
+  assert.equal(cardFor({ kind: "failed", job, mode: "draft", error: "x" }).pete, "https://alclad.app/pete?job=pj_1");
+  const acts = teamsBody(d).attachments[0].content.actions;
+  assert.deepEqual(acts.map((a) => [a.title, a.url]), [["Ask Pete", "https://alclad.app/pete?job=pj_1&draft=d7"], ["Open the page", "https://alclad.app/production/cladding/panels/job/pj_1/draft/d7"]]);
+});
+
 test("posting: sent with the webhook; no webhook, a refusal or a network error never throws", async () => {
   const sent = [];
   const ok = await notifyTeams({ kind: "release", job, set: { no: 1 } }, { env: { PANEL_TEAMS_WEBHOOK: "https://hook" }, fetchImpl: async (u, o) => { sent.push([u, JSON.parse(o.body)]); return { ok: true }; }, log: quiet });
