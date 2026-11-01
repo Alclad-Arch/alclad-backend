@@ -17,6 +17,27 @@ import crypto from "crypto";
 import Anthropic, { toFile } from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";
 import { taskText, jobJson, firstContent, requestBody, outputGroups, finalText, outputPath, roleOf, addUsage, MAX_CALLS, LEASE_MS } from "./panelRun.js";
+import { notifyTeams } from "./panelNotify.js";
+
+/* Tell the team (part 5): only real work on the LIVE app — never a practice replay or the dev database. Never
+   throws: the run already succeeded or failed on its own terms. */
+async function tell(t, run, kind, extra = {}, notify = notifyTeams, log = console) {
+  if (t.name !== "live" || run.fake) return;
+  try {
+    const db = t.db;
+    const { data: job } = await db.from("panel_jobs").select("id, name").eq("id", run.job_id).maybeSingle();
+    let ev = { kind, job: job || { id: run.job_id }, mode: run.mode, ...extra };
+    if (kind === "draft") {
+      const { data: d } = await db.from("panel_drafts").select("id, rev, review_status, review").eq("id", run.draft_id).maybeSingle();
+      ev = { ...ev, draft: d ? { id: d.id, rev: d.rev, review_status: d.review_status, questions: Array.isArray(d.review && d.review.questions) ? d.review.questions.length : 0 } : { id: run.draft_id } };
+    } else if (kind === "release" || kind === "recut") {
+      const { data: s } = await db.from("panel_sets").select("no, label, set_m2").eq("id", run.set_id).maybeSingle();
+      ev = { ...ev, set: s || {} };
+      if (kind === "recut") { const { data: r } = await db.from("panel_recuts").select("no, panel_ids, reason, m2").eq("id", run.recut_id).maybeSingle(); ev = { ...ev, recut: r || {} }; }
+    }
+    await notify(ev, { log });
+  } catch (e) { log.error(`[panels] Teams notice skipped: ${e.message || e}`); }
+}
 
 const BUCKET = "panel-drafting";
 const FIXTURE = "fixtures/panel-draft/";
@@ -295,7 +316,7 @@ async function fakeRun(t) {
   return { got, text: "Fake run — a stored real draft, replayed (no API call).", containerId: null };
 }
 
-export async function processRun(t, run, anthropic, log = console) {
+export async function processRun(t, run, anthropic, log = console, notify = notifyTeams) {
   const db = t.db;
   try {
     if (!["draft", "redraw", "release", "recut"].includes(run.mode)) throw new Error(`Runs of mode "${run.mode}" come in a later part of the build`);
@@ -313,6 +334,7 @@ export async function processRun(t, run, anthropic, log = console) {
     }
     await db.from("panel_runs").update({ status: "done", error: null, lease_until: null, finished_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq("id", run.id);
     log.log(`[panels] ${t.name} run ${run.id} done (${files.length} files${fake ? ", fake" : ""})`);
+    await tell(t, { ...run, fake }, release ? "release" : recut ? "recut" : "draft", {}, notify, log);
   } catch (e) {
     const msg = (e && e.message) || String(e);
     const final = (run.attempts || 1) >= MAX_ATTEMPTS || /not set|come in a later part|No stored run/.test(msg);
@@ -323,6 +345,8 @@ export async function processRun(t, run, anthropic, log = console) {
     else if (final && run.mode === "recut") { if (run.recut_id) await db.from("panel_recuts").update({ status: "failed", updated_at: new Date().toISOString() }).eq("id", run.recut_id); }
     else if (final && run.draft_id) await db.from("panel_drafts").update({ state: "failed", updated_at: new Date().toISOString() }).eq("id", run.draft_id);
     log.error(`[panels] ${t.name} run ${run.id} ${final ? "FAILED" : "will retry"}: ${msg}`);
+    // only once it has really stopped — a retry on the way isn't news
+    if (final) await tell(t, run, "failed", { error: msg }, notify, log);
   }
 }
 

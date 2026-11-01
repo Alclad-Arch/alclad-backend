@@ -304,6 +304,40 @@ test("failures: retried, then stopped with the reason on the run and the draft",
   assert.match(db3.T.panel_runs[0].error, /No stored run to replay/);
 });
 
+// ── the Teams notice (part 5): real LIVE work only, after it's done or has really stopped ──
+test("Teams: a finished live draft, release and recut are told; a practice run, the dev app and a retry are not", async () => {
+  const told = [];
+  const spy = async (ev) => { told.push(ev); return { sent: true }; };
+  let db = fakeDb(seed());
+  await processRun({ name: "live", db }, db.T.panel_runs[0], fakeClaude(TURNS), quiet, spy);
+  assert.equal(told.length, 1); assert.equal(told[0].kind, "draft"); assert.equal(told[0].job.name, "6197 Storage King Croydon");
+  assert.equal(told[0].draft.review_status, "awaiting review"); assert.equal(told[0].draft.questions, 1);
+  db = fakeDb(releaseSeed());
+  await processRun({ name: "live", db }, db.T.panel_runs[0], releaseClaude(), quiet, spy);
+  assert.equal(told.at(-1).kind, "release"); assert.equal(told.at(-1).set.no, 1);
+  db = fakeDb(recutSeed());
+  await processRun({ name: "live", db }, db.T.panel_runs[0], recutClaude(), quiet, spy);
+  assert.equal(told.at(-1).kind, "recut"); assert.deepEqual(told.at(-1).recut.panel_ids, ["E-83"]);
+  const n = told.length;
+  db = fakeDb(seed());
+  await processRun({ name: "dev", db }, db.T.panel_runs[0], fakeClaude(TURNS), quiet, spy);
+  const s = seed(); Object.assign(s.storage, { "fixtures/panel-draft/review.json": Buffer.from(JSON.stringify({ status: "awaiting review" })), "fixtures/panel-draft/manifest.json": Buffer.from("{}") });
+  db = fakeDb(s); db.T.panel_runs[0].fake = true;
+  await processRun({ name: "live", db }, db.T.panel_runs[0], null, quiet, spy);
+  db = fakeDb(seed());
+  await processRun({ name: "live", db }, db.T.panel_runs[0], fakeClaude(TURNS, { failAt: 0 }), quiet, spy);   // attempt 1 of 3: will retry
+  assert.equal(told.length, n, "the dev app, a practice replay and a retry on the way tell nobody");
+  db = fakeDb(seed()); db.T.panel_runs[0].attempts = 3;
+  await processRun({ name: "live", db }, db.T.panel_runs[0], fakeClaude([], { failAt: 0 }), quiet, spy);
+  assert.equal(told.at(-1).kind, "failed"); assert.match(told.at(-1).error, /socket hang up/);
+});
+
+test("Teams: a notice that throws never fails the run", async () => {
+  const db = fakeDb(seed());
+  await processRun({ name: "live", db }, db.T.panel_runs[0], fakeClaude(TURNS), quiet, async () => { throw new Error("teams down"); });
+  assert.equal(db.T.panel_runs[0].status, "done");
+});
+
 test("no review.json back is a failure with a reason, never an empty review", async () => {
   const db = fakeDb(seed());
   const noReview = [{ stop_reason: "end_turn", container: { id: "c" }, usage: {}, content: [res(["fm", "fs"])] }];
