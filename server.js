@@ -33,6 +33,8 @@ import { buildSearchQuery } from "./oppSearch.js";
 import { buildReviewQueries, buildPriorQueries, shapeRecord, budgetOpportunities } from "./oppReview.js";
 import { checkChanges, compositeRequest, readComposite } from "./salWrites.js";
 import { startPanelWorker } from "./panelWorker.js";
+import { parseBundle, uploadSkillVersion, SKILL_LIMIT } from "./panelSkillUpload.js";
+import Anthropic from "@anthropic-ai/sdk";
 import { serialQueue } from "./serialQueue.js";
 import { sfGrantHealth, sfGrantUsable, sfGrantSummary, SF_IDLE_DAYS } from "./sfHealth.js";
 import { syncActuals } from "./syncMyobActuals.js";
@@ -439,6 +441,28 @@ async function refreshSalesforceNow(userId, row) {
 
 
 // --- Auth status for the frontend ---
+/* --- A new version of the panel drafting skill, from the app (panelSkillUpload.js) --------------------------
+   Jed 2026-11-02: a button on Agents → Skills instead of uploadPanelSkill.js in a terminal. SUPER ADMINS only; the
+   files come as one binary bundle (not JSON — the parser above is capped at 100 kb) and go up as a new version of
+   PANEL_SKILL_ID with Render's own key. The worker uses version "latest", so its next run picks it up. */
+app.post("/api/panel/skill-version", requireSession, rateLimit({ perMin: 2, perDay: 20, action: "panel_skill" }),
+  express.raw({ type: "application/octet-stream", limit: SKILL_LIMIT + 1024 * 1024 }), async (req, res) => {
+  const { data: prof } = await supabaseAdmin.from("user_profiles").select("role").eq("id", req.userId).maybeSingle();
+  if (!prof || prof.role !== "super_admin") { audit(req, "panel_skill_denied", "not a super admin", 403); return res.status(403).json({ error: "Only a super admin can upload a new drafting skill." }); }
+  const skillId = process.env.PANEL_SKILL_ID;
+  if (!skillId || !process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: "PANEL_SKILL_ID or ANTHROPIC_API_KEY isn't set on Render." });
+  let b;
+  try { b = parseBundle(req.body); } catch (e) { return res.status(400).json({ error: e.message }); }
+  try {
+    const out = await uploadSkillVersion(new Anthropic(), skillId, b.files);
+    audit(req, "panel_skill_version", `${b.files.length} files, ${(b.total / 1048576).toFixed(1)} MB → ${out.version || "?"}`, 200);
+    res.json({ ok: true, skill_id: skillId, version: out.version, files: b.files.length, mb: Math.round(b.total / 104857.6) / 10 });
+  } catch (e) {
+    console.error("panel skill upload failed:", e && e.message);
+    res.status(502).json({ error: "Anthropic refused the upload: " + ((e && e.message) || e) });
+  }
+});
+
 app.get("/api/auth/status", requireUser, async (req, res) => {
   const { data } = await supabaseAdmin.from("salesforce_tokens")
     .select("user_id, sf_username, updated_at, last_ok_at, last_error, last_error_desc, last_error_at")
