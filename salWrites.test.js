@@ -29,6 +29,26 @@ test("⚠ nothing outside the list gets through", () => {
   assert.match(checkChanges([{ op: "update_opportunity", id: OPP, fields: { NextStep: "x".repeat(256) } }]).error, /longer than 255/);
 });
 
+test("a call or meeting can be logged against a contact alone — no deal — but never against nothing (Nathan 2026-11-06)", () => {
+  const { WhatId, ...noDeal } = callLog.fields;
+  const r = checkChanges([{ op: "create_task", fields: { ...noDeal, Subject: "Meeting - F2F" } }]);
+  assert.ok(r.changes, r.error);
+  assert.equal(r.changes[0].fields.WhoId, CON);
+  assert.ok(!("WhatId" in r.changes[0].fields));
+  const { WhoId, ...nothing } = noDeal;
+  assert.match(checkChanges([{ op: "create_task", fields: nothing }]).error, /needs a deal \(WhatId\) or a contact \(WhoId\)/);
+  // a new contact counts as the contact
+  assert.ok(checkChanges([{ op: "create_contact", fields: { LastName: "Bloggs", AccountId: ACC } }, { op: "create_task", fields: { ...nothing, WhoId: "$new_contact" } }]).changes);
+});
+
+test("a deal's close date, hit list date, hit list notes and rating can be updated (Nathan 2026-11-06)", () => {
+  const r = checkChanges([{ op: "update_opportunity", id: OPP, fields: { CloseDate: "2027-02-24", Hit_List_Date__c: "2026-12-01", Hit_List_Notes__c: "Needs the fin price before Xmas", Project_Rating__c: "GREEN" } }]);
+  assert.ok(r.changes, r.error);
+  assert.deepEqual(r.changes[0].fields, { CloseDate: "2027-02-24", Hit_List_Date__c: "2026-12-01", Hit_List_Notes__c: "Needs the fin price before Xmas", Project_Rating__c: "GREEN" });
+  assert.match(checkChanges([{ op: "update_opportunity", id: OPP, fields: { CloseDate: "end of Feb" } }]).error, /CloseDate must be a date/);
+  assert.match(checkChanges([{ op: "update_opportunity", id: OPP, fields: { Hit_List_Date__c: "soon" } }]).error, /Hit_List_Date__c must be a date/);
+});
+
 test("a new contact can be used by the tasks after it — never before, never two", () => {
   const con = { op: "create_contact", fields: { FirstName: "Peter", LastName: "Smith", AccountId: ACC } };
   const ok = checkChanges([con, { ...callLog, fields: { ...callLog.fields, WhoId: "$new_contact" } }]);

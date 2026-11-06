@@ -9,7 +9,8 @@
 //   create_contact       a contact on an Account (only when the person said to)
 //   create_task          a call log or a follow-up; OwnerId is always the person, never chosen
 //   update_task          complete it, move its date, add notes
-//   update_opportunity   NextStep; Project_Rating__c / StageName only when the person said so
+//   update_opportunity   NextStep, CloseDate, Hit_List_Date__c, Hit_List_Notes__c; Project_Rating__c / StageName
+//                        only when the person said so. create_task may be on a contact with no deal.
 // Deleting anything, other objects, other fields, other owners: refused.
 
 export const SAL_MAX_CHANGES = 12;
@@ -34,7 +35,9 @@ const RULES = {
   },
   create_task: {
     Subject: req(oneOf(TASK_SUBJECTS)), ActivityDate: req(date), Status: req(oneOf(["Open", "Completed"])),
-    Priority: oneOf(["Normal", "High"]), Description: text(32000), WhatId: req(id), WhoId: whoId,
+    // on a deal (WhatId), on a contact alone (WhoId, no deal — Nathan 2026-11-06: "log them against a contact"),
+    // or both; never neither (checked below)
+    Priority: oneOf(["Normal", "High"]), Description: text(32000), WhatId: id, WhoId: whoId,
     CallType: oneOf(["Inbound", "Outbound", "Internal"]), TaskSubtype: oneOf(["Task", "Email", "Call"]),
   },
   update_task: {
@@ -42,6 +45,8 @@ const RULES = {
   },
   update_opportunity: {
     NextStep: text(255), Project_Rating__c: oneOf(RATINGS), StageName: oneOf(STAGES),
+    // Nathan 2026-11-06: "update close dates, hitlist dates, hitlist notes, as well as ratings"
+    CloseDate: date, Hit_List_Date__c: date, Hit_List_Notes__c: text(32000),
   },
 };
 const OBJECT = { create_contact: "Contact", create_task: "Task", update_task: "Task", update_opportunity: "Opportunity" };
@@ -74,6 +79,7 @@ export function checkChanges(input) {
       if (!SF_ID.test(String(c.id || ""))) return { error: `${at}: which ${OBJECT[c.op]}? (no id)` };
       if (!Object.keys(clean).length) return { error: `${at}: nothing to change` };
     }
+    if (c.op === "create_task" && !clean.WhatId && !clean.WhoId) return { error: `${at}: a task needs a deal (WhatId) or a contact (WhoId)` };
     if (c.op === "create_contact" && ++contacts > 1) return { error: "Only one new contact at a time" };
     if (clean.WhoId === NEW_CONTACT && !list.slice(0, i).some((x) => x && x.op === "create_contact"))
       return { error: `${at}: uses the new contact before it is created` };
