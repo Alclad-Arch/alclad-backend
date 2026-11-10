@@ -33,6 +33,7 @@ import { buildSearchQuery } from "./oppSearch.js";
 import { buildReviewQueries, buildPriorQueries, shapeRecord, budgetOpportunities } from "./oppReview.js";
 import { checkChanges, compositeRequest, readComposite } from "./salWrites.js";
 import { startPanelWorker } from "./panelWorker.js";
+import { startMailSync } from "./mailSync.js";
 import { parseBundle, uploadSkillVersion, SKILL_LIMIT } from "./panelSkillUpload.js";
 import Anthropic from "@anthropic-ai/sdk";
 import { serialQueue } from "./serialQueue.js";
@@ -1337,4 +1338,5 @@ app.listen(PORT, () => {
   encryptTokensAtRest().catch((e) => console.error("[security] token sweep threw:", e && e.message));
   startActualsSchedule();
   startPanelWorker();   // panel drafting runs (PANEL_WORKER=on) - panelWorker.js
+  startMailSync();      // purchasing@ mailbox copy, every 5 min - mailSync.js
 });
