@@ -1033,7 +1033,9 @@ app.get("/api/salesforce/opportunity-review", requireSession, rateLimit({ perMin
     if (!hubId && takeoff && takeoff.pm_project_id) hubId = takeoff.pm_project_id;
     let hubPackages = [];
     if (hubId) {
-      const { data: pk } = await supabaseAdmin.from("pm_package_opportunities").select("scope, sf_opportunity_id, sf_opportunity_number, sf_opportunity_name").eq("pm_project_id", hubId);
+      const { data: pk, error: pkErr } = await supabaseAdmin.from("pm_package_opportunities").select("scope, sf_opportunity_id, sf_opportunity_number, sf_opportunity_name").eq("pm_project_id", hubId);
+      // A failed read is NOT "no packages" (7205, 2026-11-12: a missing grant read as "not linked").
+      if (pkErr) return hubLinksUnreadable(req, res, budget, pkErr);
       hubPackages = (pk || []).filter((p) => p && p.sf_opportunity_id);
     }
     const found = budgetOpportunities({ hubPackages, hubId, budgetOpp: extra.sfOpp || null,
@@ -1046,6 +1048,16 @@ app.get("/api/salesforce/opportunity-review", requireSession, rateLimit({ perMin
     res.status(502).json({ error: "Salesforce request failed" });
   }
 });
+
+/* The hub's opportunity links could not be read. Say so — the agent must not tell a person "no
+   opportunity is linked" when the truth is "I could not look" (Nathan 2026-11-12, 7205 Rockbank:
+   pm_package_opportunities was not granted to service_role, the error was dropped, and Scott
+   reported the job unlinked while the hub showed the link). */
+function hubLinksUnreadable(req, res, subjectId, err) {
+  console.error("opportunity-review: hub links unreadable:", err && err.code, err && err.message);
+  audit(req, "opp_review_hub_unreadable", `${subjectId} — ${(err && (err.code || err.message)) || "error"}`, 503);
+  return res.status(503).json({ error: "Could not read the Projects hub's opportunity links (this is a system fault, not a missing link) — tell an admin" });
+}
 
 /* The takeoff's deals: its hub job (its own pm_project_id, else the hub job whose links.dt names
    it), a budget built from it (cb_projects.extra.dtProjectId), and the takeoff's own stamp. */
@@ -1062,7 +1074,8 @@ async function takeoffReview(req, res, takeoffId) {
     }
     let hubPackages = [];
     if (hubId) {
-      const { data: pk } = await supabaseAdmin.from("pm_package_opportunities").select("scope, sf_opportunity_id, sf_opportunity_number, sf_opportunity_name").eq("pm_project_id", hubId);
+      const { data: pk, error: pkErr } = await supabaseAdmin.from("pm_package_opportunities").select("scope, sf_opportunity_id, sf_opportunity_number, sf_opportunity_name").eq("pm_project_id", hubId);
+      if (pkErr) return hubLinksUnreadable(req, res, takeoffId, pkErr);
       hubPackages = (pk || []).filter((p) => p && p.sf_opportunity_id);
     }
     const { data: bs } = await supabaseAdmin.from("cb_projects").select("id, extra").eq("extra->>dtProjectId", takeoffId).limit(5);
