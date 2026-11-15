@@ -110,6 +110,7 @@ test("a turn: their words with names, pictures and sheets; the job's files in a 
   assert.equal(c.turn_status, "idle"); assert.equal(c.api_upto, 1); assert.equal(c.container_id, "cntr_1");
   const reply = c.messages.at(-1);
   assert.equal(reply.role, "agent"); assert.match(reply.text, /^Rev 1 is in Claude DXFs/);
+  assert.equal(reply.ran, 2);                                                          // "Ran 2 commands", as Desktop shows
   assert.deepEqual(reply.files.map((f) => f.name), [OUT.fp.filename, OUT.fq.filename]);
   const kept = db.T.panel_files.filter((f) => f.kind === "chat_output");
   assert.equal(kept.length, 2); assert.ok(kept.every((f) => f.chat_id === "c1-0000-0000" && f.job_id === "pj_1" && /^pj_1\/chat\/c1-0000-\//.test(f.storage_path)));

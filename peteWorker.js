@@ -146,7 +146,9 @@ export async function runTurn(t, chat, anthropic, { log = console, today = null 
     files.push({ id: row ? row.id : null, name: meta.filename, storage_path: path, bytes: buf.length });
   }
   const reply = replyOf(turn) || (files.length ? "Saved." : "I didn't get to an answer - say that again?");
-  await save(db, chat.id, [{ role: "agent", text: reply, at: new Date().toISOString(), ...(files.length ? { files } : {}) }], { api_messages: api, container_id: containerId, usage, ...(waiting !== undefined ? { waiting } : {}) }, "done");
+  // "Ran 16 commands" - the line Claude Desktop shows above a reply (Jed's screenshots, 2026-11-16)
+  const ran = turn.reduce((n, m) => n + (m.role === "assistant" && Array.isArray(m.content) ? m.content.filter((b) => b && b.type === "server_tool_use").length : 0), 0);
+  await save(db, chat.id, [{ role: "agent", text: reply, at: new Date().toISOString(), ...(ran ? { ran } : {}), ...(files.length ? { files } : {}) }], { api_messages: api, container_id: containerId, usage, ...(waiting !== undefined ? { waiting } : {}) }, "done");
   return { reply, files };
 }
 
