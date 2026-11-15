@@ -6,7 +6,7 @@
 // stops with the reason, and the next message picks the question up again.
 import assert from "node:assert/strict";
 import test from "node:test";
-import { runTurn, processTurn, peteTargets } from "./peteWorker.js";
+import { runTurn, processTurn, peteTargets, plainError } from "./peteWorker.js";
 import { userTurn, withUserTurn, peteSystem, replyOf, noteOf, chatFilePath, WAITING_TOOL } from "./peteTurn.js";
 
 process.env.PANEL_SKILL_ID = "skill_test";
@@ -167,14 +167,21 @@ test("a failure stops with the reason; the next message picks the same question 
   const db = fakeDb(seed());
   const r = await processTurn({ name: "dev", db }, db.T.pete_chats[0], fakeClaude([null], { throwAt: { 0: "Your credit balance is too low" } }), quiet);
   const c = db.T.pete_chats[0];
-  assert.match(r.failed, /credit balance/); assert.equal(c.turn_status, "failed");
-  assert.match(c.messages.at(-1).text, /^Pete stopped: Your credit balance is too low/);
+  assert.match(r.failed, /out of API credit/); assert.equal(c.turn_status, "failed");
+  assert.match(c.messages.at(-1).text, /^Pete stopped: the Anthropic account is out of API credit/);
   c.messages.push({ role: "user", text: "try again", by: "Abhey" }); c.turn_status = "running";
   const claude = fakeClaude([{ stop_reason: "end_turn", container: { id: "cntr_1" }, usage: {}, content: [{ type: "text", text: "On it" }] }]);
   await runTurn({ name: "dev", db }, c, claude, { log: quiet });
   const sent = claude.calls[0].messages;
   assert.equal(sent.length, 1);                                                        // ONE user turn, never two in a row
   assert.ok(sent[0].content.some((b) => b.type === "text" && /Draft the OF2 South/.test(b.text)) && sent[0].content.some((b) => b.type === "text" && /try again/.test(b.text)));
+});
+
+test("API errors in plain words (Jed's first dev test: the raw 429 JSON)", () => {
+  const raw = '429 {"type":"error","error":{"type":"rate_limit_error","message":"You have reached your API usage limits: your organization has crossed its monthly API usage threshold, set based on your organization API tier. You will regain access on 2026-12-01 at 00:00 UTC.","details":{"error_code":"enforced_spend_limit_reached"}},"request_id":"req_1"}';
+  assert.equal(plainError(new Error(raw)), "Anthropic's monthly API limit is reached - access comes back on 1 December");
+  assert.equal(plainError(new Error('400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low"}}')), "the Anthropic account is out of API credit");
+  assert.equal(plainError(new Error("socket hang up")), "socket hang up");
 });
 
 test("pure parts: who he works for, what he's doing, where files go; targets default to dev only", () => {

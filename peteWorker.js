@@ -158,12 +158,29 @@ function addUsage(a = {}, u = {}) {
   return out;
 }
 
+/* An API error in plain words for the chat (Jed's first dev test, 2026-11-16, showed the raw 429 JSON twice): the
+   API's own message from inside the JSON, and the usage-limit case said simply. */
+export function plainError(e) {
+  const raw = String((e && e.message) || e || "");
+  let inner = (e && e.error && e.error.error && e.error.error.message) || null;
+  if (!inner) { const j = raw.indexOf("{"); if (j >= 0) { try { const o = JSON.parse(raw.slice(j)); inner = (o.error && o.error.message) || o.message || null; } catch { /* not JSON */ } } }
+  const text = inner || raw;
+  const back = /regain access on (\d{4}-\d{2}-\d{2})/.exec(text);
+  if (/usage limit|spend limit|usage threshold|enforced_spend_limit/i.test(raw + text)) {
+    const d = back ? new Date(back[1] + "T00:00:00Z").toLocaleDateString("en-AU", { day: "numeric", month: "long", timeZone: "UTC" }) : null;
+    return `Anthropic's monthly API limit is reached${d ? ` - access comes back on ${d}` : ""}`;
+  }
+  if (/credit balance is too low/i.test(text)) return "the Anthropic account is out of API credit";
+  if (/overloaded/i.test(text)) return "Anthropic is overloaded right now - try again in a minute";
+  return text.slice(0, 400);
+}
+
 export async function processTurn(t, chat, anthropic, log = console) {
   try {
     return await runTurn(t, chat, anthropic, { log });
   } catch (e) {
-    const msg = String((e && e.message) || e).slice(0, 500);
-    log.error(`[pete] ${t.name} chat ${chat.id}: ${msg}`);
+    const msg = plainError(e);
+    log.error(`[pete] ${t.name} chat ${chat.id}: ${String((e && e.message) || e).slice(0, 500)}`);
     await save(t.db, chat.id, [{ role: "event", text: `Pete stopped: ${msg}. Send a message to try again.`, at: new Date().toISOString() }], { turn_error: msg }, "failed").catch(() => {});
     return { failed: msg };
   }
