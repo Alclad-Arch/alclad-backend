@@ -4,6 +4,7 @@
 // alclad-panel-drafting skill and code execution, the container kept between turns — as Desktop keeps its session.
 // The worker (peteWorker.js) does the I/O. Same API shape as the drafter runs (panelRun.js).
 import { PANEL_BETAS, CODE_TOOL, outputGroups } from "./panelRun.js";
+import { FOLDER_TOOLS } from "./peteFolder.js";
 
 export const PETE_MODEL = () => process.env.PETE_MODEL || process.env.PANEL_MODEL || "claude-opus-5-5";
 export const PETE_MAX_CALLS = 40;            // rounds (pause_turn / tool use) in one turn before it's called stuck
@@ -38,6 +39,8 @@ export function peteSystem({ job, people = "Abhey, and Jed when he jumps in to h
     "Save only finished drawings and production files, named exactly as the skill names them (the same name UPDATES that file on G - the Main Drawing File is one per project). Never save scratch files, json working files or pictures there.",
     "",
     "THE JOB'S FILES: job.json (settings, stock sheet sizes, panels already drawn in earlier sets, offcuts) and the current Main Drawing File (if there is one) are uploaded into your container at the start. Earlier turns' files stay in the container while it lasts; if one has gone, say so and rebuild it from the spec.",
+    "",
+    "THE JOB'S FOLDER ON G - you can LOOK, not touch: look_in_job_folder lists what's there (Claude DXFs, Layout Drawings, the whole job), read_job_document reads a PDF/Word/Excel file's text, check_files_on_g says whether your saved files reached G (or were kept beside a hand-edited copy). Look before you save (what's there now, old versions to warn about) and check after - only then say the files are in Claude DXFs. You cannot delete, move or edit anything on G: if something should go, list it for them to delete.",
     "Never say a file is saved unless you copied it to $OUTPUT_DIR. Write like a draftie in a chat - short, plain, no headings.",
     waiting ? `\nThis job is PARKED, waiting on: ${waiting}. If the latest message answers it, clear it (waiting_on with an empty note) and carry on.` : "",
   ].join("\n");
@@ -81,7 +84,7 @@ export function peteRequest({ messages, containerId, skillId, system, model = PE
   return {
     model, max_tokens: 32000, betas: PANEL_BETAS, system,
     container: { ...(containerId ? { id: containerId } : {}), skills: [{ type: "custom", skill_id: skillId, version: "latest" }] },
-    tools: [CODE_TOOL, WAITING_TOOL],
+    tools: [CODE_TOOL, WAITING_TOOL, ...FOLDER_TOOLS],
     messages,
   };
 }

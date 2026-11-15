@@ -17,6 +17,7 @@ import crypto from "crypto";
 import Anthropic, { toFile } from "@anthropic-ai/sdk";
 import { panelTargets } from "./panelWorker.js";
 import { jobJson } from "./panelRun.js";
+import { runFolderTool, FOLDER_TOOL_NAMES } from "./peteFolder.js";
 import { peteSystem, userTurn, withUserTurn, peteRequest, replyOf, noteOf, turnFileIds, chatFilePath, PETE_MAX_CALLS, PETE_LEASE_MS } from "./peteTurn.js";
 
 const BUCKET = "panel-drafting";
@@ -120,11 +121,18 @@ export async function runTurn(t, chat, anthropic, { log = console, today = null 
     // his waiting_on calls: done here, answered, and the turn carries on
     const uses = (res.content || []).filter((b) => b && b.type === "tool_use");
     if (uses.length) {
-      api = [...api, { role: "user", content: uses.map((u) => {
-        if (u.name !== "waiting_on") return { type: "tool_result", tool_use_id: u.id, content: "Unknown tool.", is_error: true };
-        waiting = String((u.input && u.input.note) || "").trim().slice(0, 200);
-        return { type: "tool_result", tool_use_id: u.id, content: waiting ? `Parked: the job shows "Waiting on ${waiting}".` : "Cleared: the job is no longer waiting." };
-      }) }];
+      const results = [];
+      for (const u of uses) {
+        if (u.name === "waiting_on") {
+          waiting = String((u.input && u.input.note) || "").trim().slice(0, 200);
+          results.push({ type: "tool_result", tool_use_id: u.id, content: waiting ? `Parked: the job shows "Waiting on ${waiting}".` : "Cleared: the job is no longer waiting." });
+        } else if (FOLDER_TOOL_NAMES.includes(u.name)) {
+          // the job's folder on G, read-only (peteFolder.js)
+          try { results.push({ type: "tool_result", tool_use_id: u.id, content: (await runFolderTool(db, { job, chatId: chat.id }, u.name, u.input || {})) || "Nothing." }); }
+          catch (e) { results.push({ type: "tool_result", tool_use_id: u.id, content: "Couldn't read it: " + String((e && e.message) || e).slice(0, 300), is_error: true }); }
+        } else results.push({ type: "tool_result", tool_use_id: u.id, content: "Unknown tool.", is_error: true });
+      }
+      api = [...api, { role: "user", content: results }];
     }
     await save(db, chat.id, [], { api_messages: api, container_id: containerId, usage, turn_note: noteOf(res.content), ...(waiting !== undefined ? { waiting } : {}) });
     if (res.stop_reason === "pause_turn" || uses.length) continue;

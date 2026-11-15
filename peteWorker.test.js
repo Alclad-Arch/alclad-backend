@@ -101,7 +101,7 @@ test("a turn: their words with names, pictures and sheets; the job's files in a 
   assert.deepEqual(first.messages[0].content.map((b) => b.type), ["container_upload", "image", "document", "container_upload", "text"]);
   assert.match(first.messages[0].content.at(-1).text, /^\[Abhey\] Draft the OF2 South sheets\n\(attached: 1 screenshot; sheets: OF2 South\.pdf\)/);
   assert.deepEqual(claude.uploads, ["1-0.png", "OF2 South.pdf", "job.json"]);       // pictures, sheets, then the job's file
-  assert.deepEqual(first.tools.map((t) => t.name), ["code_execution", "waiting_on"]);
+  assert.deepEqual(first.tools.map((t) => t.name), ["code_execution", "waiting_on", "look_in_job_folder", "read_job_document", "check_files_on_g"]);
   assert.equal(first.container.skills[0].skill_id, "skill_test");
   assert.match(first.system, /6163 Hale Oakleigh South/); assert.match(first.system, /CORRECTIONS COME IN BATCHES/);
   assert.equal(claude.calls[1].container.id, "cntr_1");                               // the container is kept
@@ -195,4 +195,17 @@ test("pure parts: who he works for, what he's doing, where files go; targets def
   assert.equal(userTurn([{ role: "agent", text: "no" }]).length, 0);
   assert.equal(WAITING_TOOL.name, "waiting_on");
   assert.deepEqual(peteTargets({ PANEL_DEV_SUPABASE_URL: "https://x.supabase.co", PANEL_DEV_SERVICE_ROLE_KEY: "k", SUPABASE_URL: "https://y.supabase.co", SUPABASE_SERVICE_ROLE_KEY: "k" }).map((t) => t.name), ["dev"]);
+});
+
+test("a folder tool in a turn: run on the job, answered, and the turn carries on", async () => {
+  const db = fakeDb(seed());
+  const claude = fakeClaude([
+    { stop_reason: "tool_use", container: { id: "cntr_1" }, usage: {}, content: [{ type: "tool_use", id: "tu1", name: "look_in_job_folder", input: { folder: "claude_dxfs" } }] },
+    { stop_reason: "end_turn", container: { id: "cntr_1" }, usage: {}, content: [{ type: "text", text: "The job isn't linked to a G folder yet." }] },
+  ]);
+  await runTurn({ name: "dev", db }, db.T.pete_chats[0], claude, { log: quiet });
+  const res = claude.calls[1].messages.at(-1).content[0];
+  assert.equal(res.type, "tool_result"); assert.equal(res.tool_use_id, "tu1");
+  assert.match(res.content, /isn't linked to a hub project/);                      // the seeded job has no hub project
+  assert.match(db.T.pete_chats[0].messages.at(-1).text, /isn't linked/);
 });
