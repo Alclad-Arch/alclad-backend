@@ -165,11 +165,15 @@ const RATE_PER_MIN = Number(process.env.SF_RATE_PER_MIN || 60);
 const RATE_PER_DAY = Number(process.env.SF_RATE_PER_DAY || 1000);
 const _buckets = new Map();   // userId → { min: {n, resetAt}, day: {n, resetAt} }
 
-function rateLimit({ perMin, perDay, action }) {
+/* `bucket` (Jed 2026-11-17): separate allowances per PURPOSE, per person. Sal's lookups ('sal') no longer share the
+   pages' allowance ('app') — the Network Map read hundreds of Salesforce queries at 7:42 and Sal, asked at the same
+   moment, was refused ("rate-limiting"). A stolen session is still bounded: 60/min per bucket, not unlimited. */
+function rateLimit({ perMin, perDay, action, bucket = "app" }) {
   return (req, res, next) => {
     const now = Date.now();
-    let b = _buckets.get(req.userId);
-    if (!b) { b = { min: { n: 0, resetAt: 0 }, day: { n: 0, resetAt: 0 } }; _buckets.set(req.userId, b); }
+    const key = `${req.userId}:${bucket}`;
+    let b = _buckets.get(key);
+    if (!b) { b = { min: { n: 0, resetAt: 0 }, day: { n: 0, resetAt: 0 } }; _buckets.set(key, b); }
     if (now > b.min.resetAt) { b.min.n = 0; b.min.resetAt = now + 60_000; }
     if (now > b.day.resetAt) { b.day.n = 0; b.day.resetAt = now + 864e5; }
 
@@ -177,7 +181,7 @@ function rateLimit({ perMin, perDay, action }) {
     if (over) {
       const retry = Math.ceil(((over === "minute" ? b.min.resetAt : b.day.resetAt) - now) / 1000);
       audit(req, "rate_limited", `${action}: ${over} limit`, 429);
-      console.warn("rate limited", { userId: req.userId, window: over });
+      console.warn("rate limited", { userId: req.userId, window: over, bucket });
       return res.status(429).set("Retry-After", String(retry))
         .json({ error: `Too many Salesforce requests — try again in ${retry > 90 ? Math.ceil(retry / 60) + " minutes" : retry + " seconds"}.` });
     }
@@ -1182,7 +1186,7 @@ async function sfMe(call) {
   if (!rec) return { status: r.status === 401 ? 401 : 502, error: "Could not read your Salesforce user" };
   return { userId: rec.Id, name: rec.Name, email: rec.Email, timeZone: rec.TimeZoneSidKey || "Australia/Melbourne" };
 }
-app.get("/api/salesforce/sal/me", requireUser, rateLimit({ perMin: RATE_PER_MIN, perDay: RATE_PER_DAY, action: "sal_me" }), async (req, res) => {
+app.get("/api/salesforce/sal/me", requireUser, rateLimit({ perMin: RATE_PER_MIN, perDay: RATE_PER_DAY, action: "sal_me", bucket: "sal" }), async (req, res) => {
   try {
     const call = await sfAsUser(req, res); if (!call) return;
     const me = await sfMe(call);
@@ -1193,7 +1197,7 @@ app.get("/api/salesforce/sal/me", requireUser, rateLimit({ perMin: RATE_PER_MIN,
     res.status(502).json({ error: "Salesforce request failed" });
   }
 });
-app.post("/api/salesforce/sal/apply", requireUser, rateLimit({ perMin: 20, perDay: RATE_PER_DAY, action: "sal_apply" }), async (req, res) => {
+app.post("/api/salesforce/sal/apply", requireUser, rateLimit({ perMin: 20, perDay: RATE_PER_DAY, action: "sal_apply", bucket: "sal" }), async (req, res) => {
   const checked = checkChanges(req.body && req.body.changes);
   if (checked.error) { audit(req, "sal_refused", checked.error, 400); return res.status(400).json({ error: checked.error }); }
   if (req.body && req.body.dryRun) return res.json({ ok: true, changes: checked.changes });
@@ -1217,8 +1221,11 @@ app.post("/api/salesforce/sal/apply", requireUser, rateLimit({ perMin: 20, perDa
   }
 });
 
-app.get("/api/salesforce/*splat", requireUser, rateLimit({ perMin: RATE_PER_MIN, perDay: RATE_PER_DAY, action: "proxy" }), async (req, res) => {
-  const sfPath = req.originalUrl.replace(/^\/api\/salesforce\//i, "");   // strip prefix, keep path + query
+/* The read-only Salesforce proxy, as a handler for a route prefix. Two routes use it: the app's pages
+   (/api/salesforce/…, the "app" allowance) and Sal (/api/salesforce/sal/q/…, his own "sal" allowance — 2026-11-17).
+   Same allowed paths, checks and audit; only the prefix stripped, the audit action and the allowance differ. */
+const sfProxy = (prefix, act) => async (req, res) => {
+  const sfPath = req.originalUrl.replace(prefix, "");   // strip prefix, keep path + query
   if (sfPath.length > SF_MAX_URL) return res.status(414).json({ error: "Request too long" });
   if (sfPath.startsWith("/") || sfPath.includes("..") || /%2e%2e/i.test(sfPath) || !SF_PATH_OK.test(sfPath)) {
     console.warn("blocked salesforce path", { userId: req.userId, method: req.method });
@@ -1248,16 +1255,19 @@ app.get("/api/salesforce/*splat", requireUser, rateLimit({ perMin: RATE_PER_MIN,
     if (len > SF_MAX_BYTES) return res.status(502).json({ error: "Salesforce response too large" });
     const data = await r.text();
     if (data.length > SF_MAX_BYTES) return res.status(502).json({ error: "Salesforce response too large" });
-    audit(req, "proxy", sfPath, r.status);
+    audit(req, act, sfPath, r.status);
     // pass the upstream content type through rather than asserting JSON — an HTML error
     // page mislabelled as JSON just confuses the caller
     res.status(r.status).type(r.headers.get("content-type") || "application/json").send(data);
   } catch (e) {
     console.error("salesforce proxy error:", e && e.name, e && e.message);
-    audit(req, "proxy_error", `${sfPath} — ${e && e.name}`, 502);
+    audit(req, `${act}_error`, `${sfPath} — ${e && e.name}`, 502);
     res.status(502).json({ error: "Salesforce request failed" });
   }
-});
+};
+// Sal's own route FIRST (Express matches in order — the general route below would swallow it)
+app.get("/api/salesforce/sal/q/*splat", requireUser, rateLimit({ perMin: RATE_PER_MIN, perDay: RATE_PER_DAY, action: "sal_proxy", bucket: "sal" }), sfProxy(/^\/api\/salesforce\/sal\/q\//i, "sal_proxy"));
+app.get("/api/salesforce/*splat", requireUser, rateLimit({ perMin: RATE_PER_MIN, perDay: RATE_PER_DAY, action: "proxy" }), sfProxy(/^\/api\/salesforce\//i, "proxy"));
 
 // Terminal error handler. Without one, Express 5 hands async rejections to finalhandler,
 // which includes err.stack in the RESPONSE unless NODE_ENV is exactly "production" —
